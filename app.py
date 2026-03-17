@@ -39,12 +39,12 @@ center_data_style.border = Border(left=Side(style='thin'), right=Side(style='thi
 center_data_style.alignment = Alignment(horizontal='center', vertical='center')
 
 # -------------------------- 页面基础设置 & 状态初始化 --------------------------
-st.set_page_config(page_title="多科目异常试卷追踪系统", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="多科目异常追踪系统", page_icon="🎯", layout="wide")
 
 if 'analysis_completed' not in st.session_state:
     st.session_state.analysis_completed = False
     st.session_state.excel_bytes = None
-    st.session_state.report_sheets = {}  # 统一存放所有 Sheet 数据
+    st.session_state.report_sheets = {}
     st.session_state.diff_df = pd.DataFrame()
     st.session_state.img_mapping = {}
     st.session_state.enable_viewer = False
@@ -154,7 +154,6 @@ def create_scan_pivot_table(all_merged_data):
     result_pivot.loc['总计'] = col_scanned.astype(str) + '/' + col_total.astype(str)
     percentage_pivot.loc['总计'] = [f"{x:.1f}%" for x in np.where(col_total > 0, (col_scanned / col_total) * 100, 0.0)]
     
-    # 强制将 index (学校) 转为普通列，方便统一无损读写
     result_pivot = result_pivot.rename_axis('学校').reset_index()
     percentage_pivot = percentage_pivot.rename_axis('学校').reset_index()
     
@@ -162,7 +161,6 @@ def create_scan_pivot_table(all_merged_data):
 
 def parse_txt_mappings(txt_files):
     mapping = {}
-    processed_subjects = set()
     for f in txt_files:
         content = f.getvalue().decode('utf-8', errors='ignore').splitlines()
         file_subject_code = None
@@ -174,8 +172,6 @@ def parse_txt_mappings(txt_files):
                     file_subject_code = parts[-3][-2:] 
                     break
         if not file_subject_code: continue
-        if file_subject_code in processed_subjects: continue
-        processed_subjects.add(file_subject_code)
         subject_name = SUBJECT_CODE_MAP.get(file_subject_code, f"未知科目_{file_subject_code}")
         
         for line in content:
@@ -199,8 +195,7 @@ def set_excel_cell_style_optimized(ws):
     
     for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
         for idx, cell in enumerate(row):
-            # 高亮处理状态
-            if headers[idx] == '处理进度' and cell.value == '已核对':
+            if headers[idx] == '处理进度' and cell.value == '已标记':
                 cell.font = Font(name='微软雅黑', size=10, color='008000', bold=True)
                 cell.alignment = Alignment(horizontal='center', vertical='center')
                 cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
@@ -214,147 +209,141 @@ def set_excel_cell_style_optimized(ws):
         ws.column_dimensions[col_letter].width = width
 
 def generate_latest_excel():
-    """根据最新的 st.session_state.report_sheets 和 diff_df 动态生成 Excel"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for sheet_name, df in st.session_state.report_sheets.items():
-            # 始终使用最新鲜的差异表
-            if sheet_name == '状态差异':
-                df = st.session_state.diff_df
+            if sheet_name == '状态差异': df = st.session_state.diff_df
             df.to_excel(writer, sheet_name=sheet_name, index=False)
             set_excel_cell_style_optimized(writer.sheets[sheet_name])
     st.session_state.excel_bytes = output.getvalue()
 
 # -------------------------- Streamlit 网页前端逻辑 --------------------------
-st.title("🎯 多科目异常试卷追踪系统")
-st.markdown("不仅能一键合并扫描数据，更能**实时标记异常原因、随时导出进度、支持断点续传处理**！")
+st.title("🎯 多科目异常试卷追踪与标记系统")
+st.markdown("不仅能找出扫描差异，更能**永久记忆您的处理标记**！每次上传最新数据，系统都会自动继承历史备注，未考/免考人员不再重复核对。")
 
-# 【核心架构拓展】：工作模式选择
-work_mode = st.radio("⚙️ 请选择当前工作模式：", 
-                     ["1. 🆕 全新分析（上传原始多科目Excel进行比对）", 
-                      "2. 🔄 继续处理（上传已导出的本系统Excel报告继续标记）"], 
-                     horizontal=True)
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    raw_files = st.file_uploader("1️⃣ 必填：上传最新各科 Excel 数据", type=['xlsx', 'xls'], accept_multiple_files=True, help="系统永远以这里的最新数据为准进行比对。")
+with col_b:
+    history_file = st.file_uploader("2️⃣ 可选：上传上次导出的本系统标记报告", type=['xlsx', 'xls'], accept_multiple_files=False, help="若上传，系统会自动读取上次标记的备注和进度，精准继承给这次的新数据。")
+with col_c:
+    txt_files = st.file_uploader("3️⃣ 可选：上传图片映射 TXT", type=['txt'], accept_multiple_files=True, help="不传则只进行纯文字标记；上传后可在面板中在线查阅试卷原图。")
 
-with st.container(border=True):
-    if work_mode.startswith("1"):
-        uploaded_files = st.file_uploader("📂 [步骤 1] 请上传所有需要对比的科目 Excel 文件（至少2个）", type=['xlsx', 'xls'], accept_multiple_files=True)
-    else:
-        uploaded_files = st.file_uploader("📂 [步骤 1] 请上传上次从本系统下载的带处理进度的 Excel 报告", type=['xlsx', 'xls'], accept_multiple_files=False)
-    
-    st.divider()
-    st.info("💡 [步骤 2] (必选) 请上传阿里云 OSS 图片映射的 TXT 文件，用于在线核对图片。")
-    txt_files = st.file_uploader("📂 请上传科目图片映射 TXT 文件", type=['txt'], accept_multiple_files=True)
-
-# 动作按钮
-if st.button("🚀 加载数据并开启工作台", type="primary", use_container_width=True):
-    if work_mode.startswith("1") and (not uploaded_files or len(uploaded_files) < 2):
-        st.warning("⚠️ 全新分析模式下，至少需要上传 2 个 Excel 文件！")
-        st.stop()
-    elif work_mode.startswith("2") and not uploaded_files:
-        st.warning("⚠️ 继续处理模式下，请上传一个历史生成的 Excel 报告！")
-        st.stop()
-        
-    if not txt_files:
-        st.warning("⚠️ 必须上传 TXT 文件，才能开启在线核对看板！")
+if st.button("🚀 开始极速分析与继承标记", type="primary", use_container_width=True):
+    if not raw_files or len(raw_files) < 2:
+        st.warning("⚠️ 必须至少上传 2 个最新科目的 Excel 文件才能进行对比！")
         st.stop()
 
-    with st.spinner('🚀 正在解析数据并构建工作流...'):
+    with st.spinner('🚀 正在合并最新数据并继承历史记忆...'):
         st.session_state.report_sheets = {}
         
-        # ================= 模式一：全新分析 =================
-        if work_mode.startswith("1"):
-            merged_data = []
-            with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 8)) as executor:
-                futures = {executor.submit(load_uploaded_file, f): f for f in uploaded_files}
-                for future in as_completed(futures):
-                    file_data, subject = future.result()
-                    if file_data is not None and not file_data.empty: merged_data.append(file_data)
+        # 1. 解析最新原始数据
+        merged_data = []
+        with ThreadPoolExecutor(max_workers=min(len(raw_files), 8)) as executor:
+            futures = {executor.submit(load_uploaded_file, f): f for f in raw_files}
+            for future in as_completed(futures):
+                file_data, subject = future.result()
+                if file_data is not None and not file_data.empty: merged_data.append(file_data)
 
-            if not merged_data:
-                st.error("❌ 未读取到有效数据，请检查文件格式。")
-                st.stop()
-
-            all_merged = pd.concat(merged_data, ignore_index=True)
-            student_list_data = generate_student_list_data(all_merged)
-            pivot_tables = create_scan_pivot_table(all_merged)
-            classification_result = classify_scan_status(all_merged)
-            
-            # 存储基础表
-            st.session_state.report_sheets['名单数据'] = student_list_data
-            st.session_state.report_sheets['扫描数量透视表'] = pivot_tables['数量透视表']
-            st.session_state.report_sheets['扫描百分比透视表'] = pivot_tables['百分比透视表']
-            
-            for sheet_name, df in classification_result.items():
-                if not df.empty:
-                    # 【关键】为差异表增加处理标记列
-                    if sheet_name == '状态差异':
-                        df.insert(0, '处理进度', '未处理')
-                        df.insert(1, '处理备注', '')
-                    st.session_state.report_sheets[sheet_name] = df
-                    
-            st.session_state.diff_df = st.session_state.report_sheets.get('状态差异', pd.DataFrame())
-            
-        # ================= 模式二：继续处理 =================
-        else:
-            xls = pd.ExcelFile(uploaded_files)
-            for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name)
-                # 兼容性修复：确保旧表格也有这两个字段
-                if sheet_name == '状态差异':
-                    if '处理进度' not in df.columns: df.insert(0, '处理进度', '未处理')
-                    if '处理备注' not in df.columns: df.insert(1, '处理备注', '')
-                st.session_state.report_sheets[sheet_name] = df
-            
-            st.session_state.diff_df = st.session_state.report_sheets.get('状态差异', pd.DataFrame())
-
-        # 统一解析图片并保存
-        st.session_state.img_mapping = parse_txt_mappings(txt_files)
-        st.session_state.enable_viewer = True
-        st.session_state.analysis_completed = True
+        all_merged = pd.concat(merged_data, ignore_index=True)
+        student_list_data = generate_student_list_data(all_merged)
+        pivot_tables = create_scan_pivot_table(all_merged)
+        classification_result = classify_scan_status(all_merged)
         
-        # 初始生成一次 Excel
+        st.session_state.report_sheets['名单数据'] = student_list_data
+        st.session_state.report_sheets['扫描数量透视表'] = pivot_tables['数量透视表']
+        st.session_state.report_sheets['扫描百分比透视表'] = pivot_tables['百分比透视表']
+        
+        # 2. 提取最新状态差异，并预埋处理字段
+        new_diff_df = classification_result['状态差异'].copy()
+        if not new_diff_df.empty:
+            new_diff_df.insert(0, '处理进度', '未处理')
+            new_diff_df.insert(1, '处理备注', '')
+        
+        # 3. 核心：如果上传了历史表格，自动提取并覆盖继承
+        inherited_count = 0
+        if history_file and not new_diff_df.empty:
+            try:
+                hist_df = pd.read_excel(history_file, sheet_name='状态差异')
+                if '考号' in hist_df.columns and '处理进度' in hist_df.columns:
+                    # 构建记忆字典 { "198060001": "已标记" }
+                    hist_status = hist_df.set_index(hist_df['考号'].astype(str))['处理进度'].to_dict()
+                    hist_remark = hist_df.set_index(hist_df['考号'].astype(str))['处理备注'].to_dict() if '处理备注' in hist_df.columns else {}
+                    
+                    def apply_status(row):
+                        sid = str(row['考号'])
+                        return hist_status.get(sid, '未处理')
+                        
+                    def apply_remark(row):
+                        sid = str(row['考号'])
+                        # 只有在存在并且不是 nan 时才继承
+                        rem = hist_remark.get(sid, '')
+                        return rem if pd.notna(rem) else ''
+                        
+                    new_diff_df['处理进度'] = new_diff_df.apply(apply_status, axis=1)
+                    new_diff_df['处理备注'] = new_diff_df.apply(apply_remark, axis=1)
+                    inherited_count = len(new_diff_df[new_diff_df['处理进度'] == '已标记'])
+            except Exception as e:
+                st.warning(f"⚠️ 提取历史继承数据时出错: {e}")
+
+        for sheet_name, df in classification_result.items():
+            if sheet_name == '状态差异':
+                st.session_state.report_sheets[sheet_name] = new_diff_df
+            elif not df.empty:
+                st.session_state.report_sheets[sheet_name] = df
+                
+        st.session_state.diff_df = new_diff_df
+        
+        # 4. 解析图片（可选）
+        if txt_files:
+            st.session_state.img_mapping = parse_txt_mappings(txt_files)
+            st.session_state.enable_viewer = True
+        else:
+            st.session_state.enable_viewer = False
+            st.session_state.img_mapping = {}
+
+        st.session_state.analysis_completed = True
         generate_latest_excel()
+        
+        if inherited_count > 0:
+            st.toast(f"🎉 成功从历史文件中继承了 {inherited_count} 名考生的标记记录！")
 
 # -------------------------- 沉浸式处理工作台 --------------------------
 if st.session_state.analysis_completed:
     st.divider()
-    
-    # 顶部状态统计
     diff_df = st.session_state.diff_df
+    
     if diff_df.empty:
-        st.success("🎉 太棒了！本次数据没有任何状态差异的考生。")
+        st.success("🎉 太棒了！本次最新数据中没有任何状态差异的考生。")
         st.stop()
         
     total_diff = len(diff_df)
-    processed_count = len(diff_df[diff_df['处理进度'] == '已核对'])
+    processed_count = len(diff_df[diff_df['处理进度'] == '已标记'])
     pending_count = total_diff - processed_count
     
-    st.header("💻 异常试卷在线处理台")
+    st.header("💻 异常名单在线标记台")
     col1, col2, col3 = st.columns(3)
-    col1.metric("⚠️ 总需核对人数", f"{total_diff} 人")
-    col2.metric("✅ 已核对完毕", f"{processed_count} 人")
-    col3.metric("⏳ 待处理", f"{pending_count} 人")
+    col1.metric("⚠️ 差异大名单人数", f"{total_diff} 人")
+    col2.metric("✅ 已知情 / 已标记", f"{processed_count} 人")
+    col3.metric("⏳ 尚未查明待处理", f"{pending_count} 人")
     
-    # 动态下载按钮 (无论何时点击，下载的都是带有最新标记的 Excel)
     st.download_button(
-        label="💾 保存并导出最新进度 Excel 报告 (处理完随时可点)",
+        label="💾 下载最新进度 Excel 报告 (处理完随时可点，作为下次的继承凭证)",
         data=st.session_state.excel_bytes,
         file_name="多科目状态追踪与处理报告.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
     )
-    
     st.markdown("---")
 
-    # ==================== 动态标记互动区 ====================
+    # 构造下拉选项
     options = []
-    # 格式: [未处理] 198060001 | 王若涵
     for _, row in diff_df.iterrows():
-        status_icon = "🟢 [已核对]" if str(row.get('处理进度')) == '已核对' else "🔴 [未处理]"
+        status_icon = "🟢 [已标记]" if str(row.get('处理进度')) == '已标记' else "🔴 [未处理]"
         options.append(f"{status_icon} {row['考号']} | {row['姓名']} | {row['学校']} {row['班级']}")
     
-    selected_option = st.selectbox("🔍 请搜索或下拉选择要处理的考生：", options, index=0)
+    selected_option = st.selectbox("🔍 搜索或选择考生进行标记（下拉可见历史继承状态）：", options, index=0)
     
     if selected_option:
         student_id = selected_option.split(" | ")[0].split("] ")[1].strip()
@@ -369,52 +358,45 @@ if st.session_state.analysis_completed:
             scanned_subjs = str(row_data['已扫科目']).split('; ')
             unscanned_subjs = str(row_data['未扫科目'])
             
-            # 分两列排版：左边看图，右边打标记
-            view_col, action_col = st.columns([7, 3])
+            view_col, action_col = st.columns([6, 4])
             
             with view_col:
-                st.markdown(f"**当前核对：** `{student_name} ({student_id})` 　|　 ❌ **未扫科目：** `{unscanned_subjs}`")
-                valid_images = []
-                for subj in scanned_subjs:
-                    url = st.session_state.img_mapping.get((student_id, subj))
-                    if url: valid_images.append((subj, url))
+                st.markdown(f"**当前查验：** `{student_name} ({student_id})` 　|　 ❌ **差异科目：** `{unscanned_subjs}`")
                 
-                if valid_images:
-                    img_cols = st.columns(len(valid_images) if len(valid_images) <= 2 else 2)
-                    for idx, (subj, url) in enumerate(valid_images):
-                        with img_cols[idx % 2]:
-                            st.markdown(f"📄 **{subj}**")
-                            html_img = f'''
-                            <a href="{url}" target="_blank">
-                                <img src="{url}" style="width:100%; border-radius:4px; border:1px solid #ccc;"/>
-                            </a>
-                            <div style="text-align:center; margin-top:4px;">
-                                <a href="{url}" target="_blank" style="text-decoration:none; font-size:12px;">🔍 点此放大查看</a>
-                            </div>
-                            <br>
-                            '''
-                            st.markdown(html_img, unsafe_allow_html=True)
+                # 如果没上传 TXT，就不渲染图片模块
+                if not st.session_state.enable_viewer:
+                    st.info("ℹ️ 未上传图片映射 TXT，无法预览试卷。如已知晓原因（如缺考），请直接在右侧填写备注并标记。")
                 else:
-                    st.info("⚠️ 该考生暂无匹配的试卷第一页图片。")
+                    valid_images = []
+                    for subj in scanned_subjs:
+                        url = st.session_state.img_mapping.get((student_id, subj))
+                        if url: valid_images.append((subj, url))
+                    
+                    if valid_images:
+                        img_cols = st.columns(len(valid_images) if len(valid_images) <= 2 else 2)
+                        for idx, (subj, url) in enumerate(valid_images):
+                            with img_cols[idx % 2]:
+                                st.markdown(f"📄 **{subj}**")
+                                html_img = f'''
+                                <a href="{url}" target="_blank">
+                                    <img src="{url}" style="width:100%; border-radius:4px; border:1px solid #ccc;"/>
+                                </a>
+                                '''
+                                st.markdown(html_img, unsafe_allow_html=True)
+                    else:
+                        st.warning("⚠️ 暂无匹配的试卷第一页图片。")
             
-            # 右侧操作表单
             with action_col:
                 with st.form(key=f"form_{student_id}"):
-                    st.subheader("📝 标记操作")
-                    new_status = st.radio("处理进度：", ["未处理", "已核对"], index=0 if current_status == '未处理' else 1)
-                    new_remark = st.text_area("异常原因备注：", value=current_remark if current_remark != 'nan' else '', height=120, placeholder="例如：缺考 / 走错考场 / 答题卡损坏...")
+                    st.subheader("📝 添加状态与备注")
+                    new_status = st.radio("当前状态：", ["未处理", "已标记"], index=0 if current_status == '未处理' else 1)
+                    new_remark = st.text_input("差异原因 (必填/选填)：", value=current_remark if current_remark != 'nan' else '', placeholder="如：语文缺考、试卷污染无法扫描等...")
                     
-                    if st.form_submit_button("✅ 保存标记结果", type="primary", use_container_width=True):
-                        # 更新内存里的 DataFrame
+                    if st.form_submit_button("✅ 确认保存", type="primary", use_container_width=True):
                         idx_to_update = st.session_state.diff_df.index[st.session_state.diff_df['考号'].astype(str) == student_id].tolist()
                         if idx_to_update:
                             st.session_state.diff_df.at[idx_to_update[0], '处理进度'] = new_status
                             st.session_state.diff_df.at[idx_to_update[0], '处理备注'] = new_remark
-                            
-                            # 重新生成 Excel 字节流
                             generate_latest_excel()
-                            
-                            st.toast(f"✅ {student_name} 的处理结果已保存！")
-                            st.rerun() # 瞬间刷新页面，更新顶部下拉框状态
-        else:
-            st.error("⚠️ 未能匹配到该考生的详细数据，请重新选择。")
+                            st.toast(f"✅ {student_name} 的标记结果已永久保存！")
+                            st.rerun()
