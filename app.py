@@ -38,14 +38,13 @@ center_data_style.font = Font(name='微软雅黑', size=10)
 center_data_style.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 center_data_style.alignment = Alignment(horizontal='center', vertical='center')
 
-# -------------------------- 页面基础设置 --------------------------
-st.set_page_config(page_title="多科目扫描状态分析工具", page_icon="📊", layout="wide")
+# -------------------------- 页面基础设置 & 状态初始化 --------------------------
+st.set_page_config(page_title="多科目异常试卷追踪系统", page_icon="🎯", layout="wide")
 
-# 初始化 Session State（保证查阅图片时，页面不会重置刷新）
 if 'analysis_completed' not in st.session_state:
     st.session_state.analysis_completed = False
     st.session_state.excel_bytes = None
-    st.session_state.metrics = {}
+    st.session_state.report_sheets = {}  # 统一存放所有 Sheet 数据
     st.session_state.diff_df = pd.DataFrame()
     st.session_state.img_mapping = {}
     st.session_state.enable_viewer = False
@@ -57,8 +56,7 @@ def extract_subject_from_filename(filename):
     if match:
         subject = match.group(1).strip()
         non_subject = ['名单', '成绩', '数据', '统计', '考试', '期末', '期中']
-        if not any(kw in subject for kw in non_subject):
-            return subject
+        if not any(kw in subject for kw in non_subject): return subject
     base_name = os.path.splitext(filename)[0]
     return f"未知科目_{base_name[-4:]}" if len(base_name) >=4 else "未知科目"
 
@@ -156,30 +154,15 @@ def create_scan_pivot_table(all_merged_data):
     result_pivot.loc['总计'] = col_scanned.astype(str) + '/' + col_total.astype(str)
     percentage_pivot.loc['总计'] = [f"{x:.1f}%" for x in np.where(col_total > 0, (col_scanned / col_total) * 100, 0.0)]
     
-    result_pivot.index.name = percentage_pivot.index.name = '学校'
+    # 强制将 index (学校) 转为普通列，方便统一无损读写
+    result_pivot = result_pivot.rename_axis('学校').reset_index()
+    percentage_pivot = percentage_pivot.rename_axis('学校').reset_index()
+    
     return {'数量透视表': result_pivot, '百分比透视表': percentage_pivot}
 
-def set_excel_cell_style_optimized(ws):
-    for cell in ws[1]: cell.style = header_style
-    max_row, max_col, headers = ws.max_row, ws.max_column, [cell.value for cell in ws[1]]
-    center_cols_idx = {i for i, h in enumerate(headers) if h in ['涉及科目数', '扫描状态分类', '考号', '学号']}
-    if '学校' in headers and max_row >= 2: center_cols_idx = set(range(max_col))
-    
-    for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
-        for idx, cell in enumerate(row): cell.style = center_data_style if idx in center_cols_idx else data_style
-    
-    for col in ws.columns:
-        col_letter, header_val = col[0].column_letter, str(col[0].value) if col[0].value else ""
-        max_len = max([len(str(cell.value)) for cell in col[:100] if cell.value] or [0])
-        width = min(max_len + 4, 40) if '科目' in header_val and '数' not in header_val else min(max_len + 3, 20) if '总计' in header_val or '学校' in header_val else min(max_len + 3, 15)
-        ws.column_dimensions[col_letter].width = width
-
-# -------------------------- 新增：纯在线浏览 TXT 映射解析 --------------------------
 def parse_txt_mappings(txt_files):
-    """解析 TXT 文件，仅提取映射字典，不下载任何文件"""
     mapping = {}
     processed_subjects = set()
-    
     for f in txt_files:
         content = f.getvalue().decode('utf-8', errors='ignore').splitlines()
         file_subject_code = None
@@ -190,187 +173,248 @@ def parse_txt_mappings(txt_files):
                 if len(parts) >= 3:
                     file_subject_code = parts[-3][-2:] 
                     break
-                    
         if not file_subject_code: continue
-        
-        if file_subject_code in processed_subjects:
-            st.warning(f"⚠️ 检测到重复科目TXT文件（提取科目代码：{file_subject_code}），仅处理第一个匹配的文件。")
-            continue
-            
+        if file_subject_code in processed_subjects: continue
         processed_subjects.add(file_subject_code)
         subject_name = SUBJECT_CODE_MAP.get(file_subject_code, f"未知科目_{file_subject_code}")
         
         for line in content:
             if '\t' not in line: continue
             url, local_path = line.split('\t', 1)
-            # 安全脱壳
             url = url.strip().strip('"').strip("'")
             local_path = local_path.strip().replace('/', '\\')
             parts = local_path.split('\\')
-            
-            if len(parts) >= 3:
-                file_name = parts[-1]
-                if '(1)' in file_name: 
-                    student_dir = parts[-2]
-                    student_id = student_dir.split('(')[0] 
-                    mapping[(student_id, subject_name)] = url
-                    
+            if len(parts) >= 3 and '(1)' in parts[-1]: 
+                student_dir = parts[-2]
+                student_id = student_dir.split('(')[0] 
+                mapping[(student_id, subject_name)] = url
     return mapping
 
-# -------------------------- Streamlit 网页前端逻辑 --------------------------
-st.title("🚀 多科目考生扫描状态分析工具")
-st.markdown("上传扫描数据，极速生成分析报告。**支持直接在网页内置面板核对异常试卷，零存储零等待！**")
+# -------------------------- 统一 Excel 生成器 --------------------------
+def set_excel_cell_style_optimized(ws):
+    for cell in ws[1]: cell.style = header_style
+    max_row, max_col, headers = ws.max_row, ws.max_column, [cell.value for cell in ws[1]]
+    center_cols_idx = {i for i, h in enumerate(headers) if h in ['涉及科目数', '扫描状态分类', '考号', '学号', '处理进度']}
+    if '学校' in headers and max_row >= 2: center_cols_idx = set(range(max_col))
+    
+    for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
+        for idx, cell in enumerate(row):
+            # 高亮处理状态
+            if headers[idx] == '处理进度' and cell.value == '已核对':
+                cell.font = Font(name='微软雅黑', size=10, color='008000', bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+            else:
+                cell.style = center_data_style if idx in center_cols_idx else data_style
+    
+    for col in ws.columns:
+        col_letter, header_val = col[0].column_letter, str(col[0].value) if col[0].value else ""
+        max_len = max([len(str(cell.value)) for cell in col[:100] if cell.value] or [0])
+        width = min(max_len + 4, 40) if '科目' in header_val and '数' not in header_val else min(max_len + 3, 20) if '总计' in header_val or '学校' in header_val else min(max_len + 3, 15)
+        ws.column_dimensions[col_letter].width = width
 
-# 数据上传区
+def generate_latest_excel():
+    """根据最新的 st.session_state.report_sheets 和 diff_df 动态生成 Excel"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        for sheet_name, df in st.session_state.report_sheets.items():
+            # 始终使用最新鲜的差异表
+            if sheet_name == '状态差异':
+                df = st.session_state.diff_df
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            set_excel_cell_style_optimized(writer.sheets[sheet_name])
+    st.session_state.excel_bytes = output.getvalue()
+
+# -------------------------- Streamlit 网页前端逻辑 --------------------------
+st.title("🎯 多科目异常试卷追踪系统")
+st.markdown("不仅能一键合并扫描数据，更能**实时标记异常原因、随时导出进度、支持断点续传处理**！")
+
+# 【核心架构拓展】：工作模式选择
+work_mode = st.radio("⚙️ 请选择当前工作模式：", 
+                     ["1. 🆕 全新分析（上传原始多科目Excel进行比对）", 
+                      "2. 🔄 继续处理（上传已导出的本系统Excel报告继续标记）"], 
+                     horizontal=True)
+
 with st.container(border=True):
-    uploaded_files = st.file_uploader("📂 请选择所有需要对比的科目 Excel 文件（至少2个）", type=['xlsx', 'xls'], accept_multiple_files=True)
+    if work_mode.startswith("1"):
+        uploaded_files = st.file_uploader("📂 [步骤 1] 请上传所有需要对比的科目 Excel 文件（至少2个）", type=['xlsx', 'xls'], accept_multiple_files=True)
+    else:
+        uploaded_files = st.file_uploader("📂 [步骤 1] 请上传上次从本系统下载的带处理进度的 Excel 报告", type=['xlsx', 'xls'], accept_multiple_files=False)
     
     st.divider()
-    enable_img_viewer = st.checkbox("🧩 启用「异常试卷在线看图面板」功能", help="上传 TXT 后，无需下载任何图片，直接在网页下方查看差异考生的在线试卷。")
-    txt_files = []
-    if enable_img_viewer:
-        st.info("💡 请上传阿里云 OSS 图片映射的 TXT 文件。")
-        txt_files = st.file_uploader("📂 请上传科目图片映射 TXT 文件", type=['txt'], accept_multiple_files=True)
+    st.info("💡 [步骤 2] (必选) 请上传阿里云 OSS 图片映射的 TXT 文件，用于在线核对图片。")
+    txt_files = st.file_uploader("📂 请上传科目图片映射 TXT 文件", type=['txt'], accept_multiple_files=True)
 
 # 动作按钮
-if st.button("开始极速分析", type="primary", use_container_width=True):
-    if len(uploaded_files) < 2:
-        st.warning("⚠️ 至少需要上传 2 个 Excel 文件才能进行对比！")
+if st.button("🚀 加载数据并开启工作台", type="primary", use_container_width=True):
+    if work_mode.startswith("1") and (not uploaded_files or len(uploaded_files) < 2):
+        st.warning("⚠️ 全新分析模式下，至少需要上传 2 个 Excel 文件！")
+        st.stop()
+    elif work_mode.startswith("2") and not uploaded_files:
+        st.warning("⚠️ 继续处理模式下，请上传一个历史生成的 Excel 报告！")
         st.stop()
         
-    if enable_img_viewer and not txt_files:
-        st.warning("⚠️ 启用了图片浏览功能但未检测到TXT文件，将仅输出原有Excel报告。")
-        enable_img_viewer = False
+    if not txt_files:
+        st.warning("⚠️ 必须上传 TXT 文件，才能开启在线核对看板！")
+        st.stop()
 
-    with st.spinner('🚀 正在多线程读取并分析数据...'):
-        merged_data = []
-        with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 8)) as executor:
-            futures = {executor.submit(load_uploaded_file, f): f for f in uploaded_files}
-            for future in as_completed(futures):
-                file_data, subject = future.result()
-                if file_data is not None and not file_data.empty: merged_data.append(file_data)
-
-        if not merged_data:
-            st.error("❌ 未读取到有效数据，请检查文件格式。")
-            st.stop()
-
-        all_merged = pd.concat(merged_data, ignore_index=True)
-        student_list_data = generate_student_list_data(all_merged)
-        pivot_tables = create_scan_pivot_table(all_merged)
-        classification_result = classify_scan_status(all_merged)
+    with st.spinner('🚀 正在解析数据并构建工作流...'):
+        st.session_state.report_sheets = {}
         
-        # 提取并在状态中保存差异表和指标
-        diff_df = classification_result['状态差异']
-        st.session_state.metrics = {
-            '全已扫': len(classification_result['全已扫']),
-            '全未扫': len(classification_result['全未扫']),
-            '状态差异': len(diff_df)
-        }
-        st.session_state.diff_df = diff_df
-        
-        # 解析图片字典并保存
-        if enable_img_viewer and txt_files:
-            st.session_state.img_mapping = parse_txt_mappings(txt_files)
-            st.session_state.enable_viewer = True
-        else:
-            st.session_state.enable_viewer = False
+        # ================= 模式一：全新分析 =================
+        if work_mode.startswith("1"):
+            merged_data = []
+            with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 8)) as executor:
+                futures = {executor.submit(load_uploaded_file, f): f for f in uploaded_files}
+                for future in as_completed(futures):
+                    file_data, subject = future.result()
+                    if file_data is not None and not file_data.empty: merged_data.append(file_data)
 
-    with st.spinner('💾 正在生成精美的 Excel 报告...'):
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            student_list_data.to_excel(writer, sheet_name='名单数据', index=False)
-            set_excel_cell_style_optimized(writer.sheets['名单数据'])
-            pivot_tables['数量透视表'].to_excel(writer, sheet_name='扫描数量透视表')
-            set_excel_cell_style_optimized(writer.sheets['扫描数量透视表'])
-            pivot_tables['百分比透视表'].to_excel(writer, sheet_name='扫描百分比透视表')
-            set_excel_cell_style_optimized(writer.sheets['扫描百分比透视表'])
+            if not merged_data:
+                st.error("❌ 未读取到有效数据，请检查文件格式。")
+                st.stop()
+
+            all_merged = pd.concat(merged_data, ignore_index=True)
+            student_list_data = generate_student_list_data(all_merged)
+            pivot_tables = create_scan_pivot_table(all_merged)
+            classification_result = classify_scan_status(all_merged)
+            
+            # 存储基础表
+            st.session_state.report_sheets['名单数据'] = student_list_data
+            st.session_state.report_sheets['扫描数量透视表'] = pivot_tables['数量透视表']
+            st.session_state.report_sheets['扫描百分比透视表'] = pivot_tables['百分比透视表']
             
             for sheet_name, df in classification_result.items():
                 if not df.empty:
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    set_excel_cell_style_optimized(writer.sheets[sheet_name])
+                    # 【关键】为差异表增加处理标记列
+                    if sheet_name == '状态差异':
+                        df.insert(0, '处理进度', '未处理')
+                        df.insert(1, '处理备注', '')
+                    st.session_state.report_sheets[sheet_name] = df
                     
-        st.session_state.excel_bytes = excel_buffer.getvalue()
+            st.session_state.diff_df = st.session_state.report_sheets.get('状态差异', pd.DataFrame())
+            
+        # ================= 模式二：继续处理 =================
+        else:
+            xls = pd.ExcelFile(uploaded_files)
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                # 兼容性修复：确保旧表格也有这两个字段
+                if sheet_name == '状态差异':
+                    if '处理进度' not in df.columns: df.insert(0, '处理进度', '未处理')
+                    if '处理备注' not in df.columns: df.insert(1, '处理备注', '')
+                st.session_state.report_sheets[sheet_name] = df
+            
+            st.session_state.diff_df = st.session_state.report_sheets.get('状态差异', pd.DataFrame())
+
+        # 统一解析图片并保存
+        st.session_state.img_mapping = parse_txt_mappings(txt_files)
+        st.session_state.enable_viewer = True
         st.session_state.analysis_completed = True
+        
+        # 初始生成一次 Excel
+        generate_latest_excel()
 
-# -------------------------- 全局结果展示与交互区 (脱离按钮重载影响) --------------------------
+# -------------------------- 沉浸式处理工作台 --------------------------
 if st.session_state.analysis_completed:
-    st.success("✅ 数据合并及透视分析完成！")
+    st.divider()
     
-    # 指标卡片
+    # 顶部状态统计
+    diff_df = st.session_state.diff_df
+    if diff_df.empty:
+        st.success("🎉 太棒了！本次数据没有任何状态差异的考生。")
+        st.stop()
+        
+    total_diff = len(diff_df)
+    processed_count = len(diff_df[diff_df['处理进度'] == '已核对'])
+    pending_count = total_diff - processed_count
+    
+    st.header("💻 异常试卷在线处理台")
     col1, col2, col3 = st.columns(3)
-    col1.metric("✅ 全已扫人数", f"{st.session_state.metrics['全已扫']} 人")
-    col2.metric("❌ 全未扫人数", f"{st.session_state.metrics['全未扫']} 人")
-    col3.metric("⚠️ 状态差异人数", f"{st.session_state.metrics['状态差异']} 人")
-
-    # Excel 下载按钮
+    col1.metric("⚠️ 总需核对人数", f"{total_diff} 人")
+    col2.metric("✅ 已核对完毕", f"{processed_count} 人")
+    col3.metric("⏳ 待处理", f"{pending_count} 人")
+    
+    # 动态下载按钮 (无论何时点击，下载的都是带有最新标记的 Excel)
     st.download_button(
-        label="📥 1. 点击下载完整 Excel 分析报告",
+        label="💾 保存并导出最新进度 Excel 报告 (处理完随时可点)",
         data=st.session_state.excel_bytes,
-        file_name="多科目扫描状态对比分析.xlsx",
+        file_name="多科目状态追踪与处理报告.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
     )
+    
+    st.markdown("---")
 
-    # ==================== 在线看图面板 UI ====================
-    if st.session_state.enable_viewer:
-        st.divider()
-        st.header("🖼️ 异常试卷在线查阅系统")
-        st.caption("👇 在下方选择「状态差异」的考生，您的浏览器将直接从阿里云加载该考生的试卷原图，无需下载，零内存占用。")
+    # ==================== 动态标记互动区 ====================
+    options = []
+    # 格式: [未处理] 198060001 | 王若涵
+    for _, row in diff_df.iterrows():
+        status_icon = "🟢 [已核对]" if str(row.get('处理进度')) == '已核对' else "🔴 [未处理]"
+        options.append(f"{status_icon} {row['考号']} | {row['姓名']} | {row['学校']} {row['班级']}")
+    
+    selected_option = st.selectbox("🔍 请搜索或下拉选择要处理的考生：", options, index=0)
+    
+    if selected_option:
+        student_id = selected_option.split(" | ")[0].split("] ")[1].strip()
+        student_name = selected_option.split(" | ")[1].strip()
         
-        diff_df = st.session_state.diff_df
-        if diff_df.empty:
-            st.success("🎉 太棒了！本次数据没有出现状态差异的考生。")
-        else:
-            # 构造搜索下拉框的选项
-            options = []
-            for _, row in diff_df.iterrows():
-                # 格式: 198060001 | 王若涵 | 某某学校 某某班级
-                options.append(f"{row['考号']} | {row['姓名']} | {row['学校']} {row['班级']}")
+        matched_rows = diff_df[diff_df['考号'].astype(str) == student_id]
+        
+        if not matched_rows.empty:
+            row_data = matched_rows.iloc[0]
+            current_status = str(row_data.get('处理进度', '未处理'))
+            current_remark = str(row_data.get('处理备注', ''))
+            scanned_subjs = str(row_data['已扫科目']).split('; ')
+            unscanned_subjs = str(row_data['未扫科目'])
             
-            selected_option = st.selectbox("🔍 请搜索或下拉选择要查阅核对的考生：", options, index=0)
+            # 分两列排版：左边看图，右边打标记
+            view_col, action_col = st.columns([7, 3])
             
-            if selected_option:
-                student_id = selected_option.split(" | ")[0].strip()
-                student_name = selected_option.split(" | ")[1].strip()
+            with view_col:
+                st.markdown(f"**当前核对：** `{student_name} ({student_id})` 　|　 ❌ **未扫科目：** `{unscanned_subjs}`")
+                valid_images = []
+                for subj in scanned_subjs:
+                    url = st.session_state.img_mapping.get((student_id, subj))
+                    if url: valid_images.append((subj, url))
                 
-                # 【防越界修复核心代码】：强制将 DataFrame 的考号转为字符串进行精准匹配
-                matched_rows = diff_df[diff_df['考号'].astype(str) == student_id]
-                
-                if not matched_rows.empty:
-                    row_data = matched_rows.iloc[0]
-                    scanned_subjs = str(row_data['已扫科目']).split('; ')
-                    unscanned_subjs = str(row_data['未扫科目'])
-                    
-                    # 状态标签提示
-                    st.markdown(f"**考生：** `{student_name} ({student_id})` 　|　 ❌ **未扫记录：** `{unscanned_subjs}`")
-                    
-                    # 提取图片 URL
-                    valid_images = []
-                    img_mapping = st.session_state.img_mapping
-                    for subj in scanned_subjs:
-                        url = img_mapping.get((student_id, subj))
-                        if url: valid_images.append((subj, url))
-                    
-                    if valid_images:
-                        # 动态列排版，一行最多放 3 张图
-                        cols = st.columns(len(valid_images) if len(valid_images) <= 3 else 3)
-                        for idx, (subj, url) in enumerate(valid_images):
-                            with cols[idx % 3]:
-                                st.markdown(f"##### 📄 {subj}")
-                                # 使用 HTML 原生 <img> 标签，强制走前端浏览器渲染，彻底绕过后端内存
-                                html_img = f'''
-                                <a href="{url}" target="_blank" title="点击可全屏查看原图">
-                                    <img src="{url}" style="width:100%; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border:1px solid #ddd; transition: 0.3s;"/>
-                                </a>
-                                <div style="text-align:center; margin-top:8px;">
-                                    <a href="{url}" target="_blank" style="text-decoration:none; color:#4472C4; font-weight:bold;">🔗 点击在新窗口看大图</a>
-                                </div>
-                                <br>
-                                '''
-                                st.markdown(html_img, unsafe_allow_html=True)
-                    else:
-                        st.warning("⚠️ 该考生暂无匹配的试卷第一页图片。")
+                if valid_images:
+                    img_cols = st.columns(len(valid_images) if len(valid_images) <= 2 else 2)
+                    for idx, (subj, url) in enumerate(valid_images):
+                        with img_cols[idx % 2]:
+                            st.markdown(f"📄 **{subj}**")
+                            html_img = f'''
+                            <a href="{url}" target="_blank">
+                                <img src="{url}" style="width:100%; border-radius:4px; border:1px solid #ccc;"/>
+                            </a>
+                            <div style="text-align:center; margin-top:4px;">
+                                <a href="{url}" target="_blank" style="text-decoration:none; font-size:12px;">🔍 点此放大查看</a>
+                            </div>
+                            <br>
+                            '''
+                            st.markdown(html_img, unsafe_allow_html=True)
                 else:
-                    st.error("⚠️ 未能匹配到该考生的详细数据，请重新选择。")
+                    st.info("⚠️ 该考生暂无匹配的试卷第一页图片。")
+            
+            # 右侧操作表单
+            with action_col:
+                with st.form(key=f"form_{student_id}"):
+                    st.subheader("📝 标记操作")
+                    new_status = st.radio("处理进度：", ["未处理", "已核对"], index=0 if current_status == '未处理' else 1)
+                    new_remark = st.text_area("异常原因备注：", value=current_remark if current_remark != 'nan' else '', height=120, placeholder="例如：缺考 / 走错考场 / 答题卡损坏...")
+                    
+                    if st.form_submit_button("✅ 保存标记结果", type="primary", use_container_width=True):
+                        # 更新内存里的 DataFrame
+                        idx_to_update = st.session_state.diff_df.index[st.session_state.diff_df['考号'].astype(str) == student_id].tolist()
+                        if idx_to_update:
+                            st.session_state.diff_df.at[idx_to_update[0], '处理进度'] = new_status
+                            st.session_state.diff_df.at[idx_to_update[0], '处理备注'] = new_remark
+                            
+                            # 重新生成 Excel 字节流
+                            generate_latest_excel()
+                            
+                            st.toast(f"✅ {student_name} 的处理结果已保存！")
+                            st.rerun() # 瞬间刷新页面，更新顶部下拉框状态
+        else:
+            st.error("⚠️ 未能匹配到该考生的详细数据，请重新选择。")
