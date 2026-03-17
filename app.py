@@ -5,11 +5,6 @@ import os
 import re
 import io
 import warnings
-import zipfile
-import tempfile
-import shutil
-import uuid
-import requests
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, NamedStyle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -17,16 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 
-# -------------------------- 全局常量 & 样式定义 --------------------------
-SUBJECT_CODE_MAP = {
-    '01': '语文', '02': '数学', '03': '英语', '04': '物理', '05': '化学',
-    '06': '生物', '07': '地理', '08': '政治', '09': '历史', '10': '理综',
-    '11': '文综', '12': '美术', '13': '音乐', '14': '思想品德', '15': '信息技术',
-    '16': '通用技术', '17': '技术', '18': '社会', '19': '科学', '20': '道德与法治',
-    '21': '生物地理', '22': '综合', '23': '物理化学', '24': '计算机',
-    '25': '历史与社会', '26': '体育'
-}
+# -------------------------- 页面基础设置 --------------------------
+st.set_page_config(page_title="多科目扫描状态分析工具", page_icon="📊", layout="wide")
 
+# -------------------------- 全局样式定义 --------------------------
 header_style = NamedStyle(name="header_style")
 header_style.font = Font(name='微软雅黑', size=11, bold=True, color='FFFFFF')
 header_style.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
@@ -43,13 +32,6 @@ center_data_style.font = Font(name='微软雅黑', size=10)
 center_data_style.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 center_data_style.alignment = Alignment(horizontal='center', vertical='center')
 
-# -------------------------- 页面基础设置 --------------------------
-st.set_page_config(page_title="多科目扫描状态分析工具", page_icon="📊", layout="wide")
-
-# 清理历史临时文件 (防止服务器磁盘爆满)
-if not os.path.exists("temp_workspace"):
-    os.makedirs("temp_workspace")
-
 # -------------------------- 核心工具函数 --------------------------
 def extract_subject_from_filename(filename):
     pattern = r'\((.*?)\)'
@@ -63,6 +45,7 @@ def extract_subject_from_filename(filename):
     return f"未知科目_{base_name[-4:]}" if len(base_name) >=4 else "未知科目"
 
 def load_uploaded_file(uploaded_file):
+    """适配 Streamlit 的内存文件读取"""
     try:
         target_cols = ['考号', '姓名', '学校', '班级', '学籍号', '扫描否', '扫描状态']
         df = pd.read_excel(
@@ -95,6 +78,11 @@ def load_uploaded_file(uploaded_file):
         
         result_df = df[required_cols].assign(科目=subject)
         result_df = result_df.drop_duplicates(subset=['考号', '科目'], keep='first')
+        
+        for col in ['学校', '姓名', '班级', '学号', '扫描状态', '科目']:
+            if result_df[col].nunique() / len(result_df) < 0.5:
+                result_df[col] = result_df[col].astype('category')
+        
         return result_df, subject
     except Exception as e:
         st.error(f"❌ 加载文件 {uploaded_file.name} 失败：{str(e)}")
@@ -106,7 +94,9 @@ def generate_student_list_data(all_merged_data):
         科目=('科目', lambda x: '; '.join(x.unique()) if not x.empty else '无'),
         涉及科目数=('科目', 'nunique')
     ).reset_index()
-    return student_list[['考号', '姓名', '学校', '班级', '科目', '涉及科目数']]
+    
+    student_list = student_list[['考号', '姓名', '学校', '班级', '科目', '涉及科目数']]
+    return student_list
 
 def classify_scan_status(all_merged_data):
     status_summary = all_merged_data.groupby('考号').agg(
@@ -150,7 +140,7 @@ def classify_scan_status(all_merged_data):
     status_summary = status_summary.merge(status_list, on='考号', how='left')
     status_summary['涉及科目数'] = status_summary['科目'].str.count(',') + 1
     
-    final_cols = ['考号', '学校', '姓名', '学号', '班级', '科目', '涉及科目数', '已扫科目', '未扫科目', '扫描状态', '扫描状态分类']
+    final_cols = ['学校', '姓名', '学号', '班级', '科目', '涉及科目数', '已扫科目', '未扫科目', '扫描状态', '扫描状态分类']
     return {
         '全已扫': status_summary[status_summary['扫描状态分类'] == '全已扫'][final_cols],
         '全未扫': status_summary[status_summary['扫描状态分类'] == '全未扫'][final_cols],
@@ -179,7 +169,8 @@ def create_scan_pivot_table(all_merged_data):
     row_scanned = scanned_pivot.sum(axis=1)
     row_total = total_pivot.sum(axis=1)
     result_pivot['总计'] = row_scanned.astype(str) + '/' + row_total.astype(str)
-    percentage_pivot['总计'] = [f"{x:.1f}%" for x in np.where(row_total > 0, (row_scanned / row_total) * 100, 0.0)]
+    row_pct = np.where(row_total > 0, (row_scanned / row_total) * 100, 0.0)
+    percentage_pivot['总计'] = [f"{x:.1f}%" for x in row_pct]
     
     col_scanned = scanned_pivot.sum(axis=0)
     col_total = total_pivot.sum(axis=0)
@@ -187,7 +178,8 @@ def create_scan_pivot_table(all_merged_data):
     col_total['总计'] = col_total.sum()
     
     result_pivot.loc['总计'] = col_scanned.astype(str) + '/' + col_total.astype(str)
-    percentage_pivot.loc['总计'] = [f"{x:.1f}%" for x in np.where(col_total > 0, (col_scanned / col_total) * 100, 0.0)]
+    col_pct = np.where(col_total > 0, (col_scanned / col_total) * 100, 0.0)
+    percentage_pivot.loc['总计'] = [f"{x:.1f}%" for x in col_pct]
     
     result_pivot.index.name = '学校'
     percentage_pivot.index.name = '学校'
@@ -199,7 +191,7 @@ def set_excel_cell_style_optimized(ws):
     max_col = ws.max_column
     headers = [cell.value for cell in ws[1]]
     
-    center_cols_idx = {i for i, h in enumerate(headers) if h in ['涉及科目数', '扫描状态分类', '考号', '学号']}
+    center_cols_idx = {i for i, h in enumerate(headers) if h in ['涉及科目数', '扫描状态分类']}
     if '学校' in headers and max_row >= 2: center_cols_idx = set(range(max_col))
     
     for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
@@ -212,7 +204,7 @@ def set_excel_cell_style_optimized(ws):
         header_val = str(col[0].value) if col[0].value else ""
         max_len = max([len(str(cell.value)) for cell in col[:100] if cell.value] or [0])
         
-        if '科目' in header_val and '数' not in header_val:
+        if col_letter in ['E'] and '科目' in headers and headers.index('科目') == 4:
             column_widths[col_letter] = min(max_len + 4, 40)
         elif '总计' in header_val or '学校' in header_val:
             column_widths[col_letter] = min(max_len + 3, 20)
@@ -222,251 +214,74 @@ def set_excel_cell_style_optimized(ws):
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
 
-# -------------------------- 新增：TXT 解析与纯后端流式下载 --------------------------
-def parse_txt_mappings(txt_files):
-    mapping = {}
-    processed_subjects = set()
-    
-    for f in txt_files:
-        content = f.getvalue().decode('utf-8', errors='ignore').splitlines()
-        file_subject_code = None
-        for line in content:
-            if '\t' in line:
-                local_path = line.split('\t')[1].strip().replace('/', '\\')
-                parts = local_path.split('\\')
-                if len(parts) >= 3:
-                    file_subject_code = parts[-3][-2:] 
-                    break
-                    
-        if not file_subject_code: continue
-        if file_subject_code in processed_subjects:
-            st.warning(f"⚠️ 检测到重复科目TXT文件（提取科目代码：{file_subject_code}），仅处理第一个匹配的文件。")
-            continue
-            
-        processed_subjects.add(file_subject_code)
-        subject_name = SUBJECT_CODE_MAP.get(file_subject_code, f"未知科目_{file_subject_code}")
-        
-        for line in content:
-            if '\t' not in line: continue
-            url, local_path = line.split('\t', 1)
-            url = url.strip().strip('"').strip("'")
-            local_path = local_path.strip().replace('/', '\\')
-            parts = local_path.split('\\')
-            
-            if len(parts) >= 3:
-                file_name = parts[-1]
-                if '(1)' in file_name: 
-                    student_dir = parts[-2]
-                    student_id = student_dir.split('(')[0] 
-                    mapping[(student_id, subject_name)] = url
-                    
-    return mapping
-
-def download_image_to_disk(task, chunk_dir):
-    """【防崩溃核心】流式下载直接写入硬盘，零内存占用"""
-    url, sid, subj = task
-    try:
-        resp = requests.get(url, stream=True, timeout=10)
-        if resp.status_code == 200:
-            sid_dir = os.path.join(chunk_dir, sid)
-            os.makedirs(sid_dir, exist_ok=True)
-            file_path = os.path.join(sid_dir, f"{subj}.jpg")
-            with open(file_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk: f.write(chunk)
-            return True, sid
-    except Exception:
-        pass
-    return False, sid
-
 # -------------------------- Streamlit 网页前端逻辑 --------------------------
 st.title("🚀 多科目考生扫描状态对比分析工具")
-st.markdown("上传包含各科目扫描数据的 Excel 文件，一键生成合并分析报告。**（防崩溃分卷下载版）**")
+st.markdown("上传包含各科目扫描数据的 Excel 文件，一键生成合并分析报告。**（数据仅在内存中处理，不保存，绝对安全）**")
 
 uploaded_files = st.file_uploader("请选择所有需要对比的科目 Excel 文件（至少2个）", type=['xlsx', 'xls'], accept_multiple_files=True)
-
-st.divider()
-enable_img_download = st.checkbox("🧩 启用试卷图片批量下载与 Excel 超链接（防内存崩溃版）", help="勾选后，系统会自动代下载图片，若图片数量极大，会自动拆分为多个 ZIP 包供您分卷下载。")
-
-txt_files = []
-if enable_img_download:
-    st.info("💡 提示：请上传图片映射 TXT 文件。服务器会将图片打包成 ZIP。如果下载了多个分卷 ZIP，解压到同一个文件夹即可完美合并。")
-    txt_files = st.file_uploader("📂 请上传科目图片映射 TXT 文件", type=['txt'], accept_multiple_files=True)
-
-# 使用 Session State 保持页面状态，防止下载按钮消失
-if 'analysis_completed' not in st.session_state:
-    st.session_state.analysis_completed = False
-    st.session_state.excel_bytes = None
-    st.session_state.zip_paths = []
-    st.session_state.metrics = {}
 
 if st.button("开始极速分析", type="primary"):
     if len(uploaded_files) < 2:
         st.warning("⚠️ 至少需要上传 2 个 Excel 文件才能进行对比！")
-        st.stop()
-        
-    if enable_img_download and not txt_files:
-        st.warning("⚠️ 启用了图片下载功能但未检测到TXT文件，将仅输出原有Excel报告。")
-        enable_img_download = False
-
-    # 清理上一次的缓存
-    shutil.rmtree("temp_workspace", ignore_errors=True)
-    os.makedirs("temp_workspace", exist_ok=True)
-
-    with st.spinner('🚀 正在多线程读取 Excel 数据...'):
-        merged_data = []
-        all_subjects = []
-        with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 8)) as executor:
-            futures = {executor.submit(load_uploaded_file, f): f for f in uploaded_files}
-            for future in as_completed(futures):
-                file_data, subject = future.result()
-                if file_data is not None and not file_data.empty:
-                    merged_data.append(file_data)
-                    all_subjects.append(subject)
-
-        if not merged_data:
-            st.error("❌ 未读取到有效数据，请检查文件格式。")
-            st.stop()
-
-        all_merged = pd.concat(merged_data, ignore_index=True)
-    
-    with st.spinner('📊 正在进行矩阵透视计算与分类...'):
-        student_list_data = generate_student_list_data(all_merged)
-        pivot_tables = create_scan_pivot_table(all_merged)
-        classification_result = classify_scan_status(all_merged)
-        
-        # 记录指标展示
-        st.session_state.metrics = {
-            '全已扫': len(classification_result['全已扫']),
-            '全未扫': len(classification_result['全未扫']),
-            '状态差异': len(classification_result['状态差异'])
-        }
-
-    zip_paths = []
-    students_with_images = set()
-
-    if enable_img_download and txt_files:
-        st.info("🔗 正在解析图片链接...")
-        img_mapping = parse_txt_mappings(txt_files)
-        
-        diff_df = classification_result['状态差异']
-        download_tasks = []
-        
-        for _, row in diff_df.iterrows():
-            student_id = str(row['考号'])
-            scanned_subjs = str(row['已扫科目']).split('; ')
-            for subj in scanned_subjs:
-                key = (student_id, subj)
-                if key in img_mapping:
-                    download_tasks.append((img_mapping[key], student_id, subj))
-        
-        if download_tasks:
-            # 【核心逻辑：分批打包】每 800 张图片一个 ZIP
-            CHUNK_SIZE = 800
-            task_chunks = [download_tasks[i:i + CHUNK_SIZE] for i in range(0, len(download_tasks), CHUNK_SIZE)]
+    else:
+        with st.spinner('🚀 正在多线程读取数据...'):
+            merged_data = []
+            all_subjects = []
             
-            session_id = str(uuid.uuid4())[:8]
-            base_dir = f"temp_workspace/{session_id}"
-            os.makedirs(base_dir, exist_ok=True)
+            with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 8)) as executor:
+                futures = {executor.submit(load_uploaded_file, f): f for f in uploaded_files}
+                for future in as_completed(futures):
+                    file_data, subject = future.result()
+                    if file_data is not None and not file_data.empty:
+                        merged_data.append(file_data)
+                        all_subjects.append(subject)
+
+            if not merged_data:
+                st.error("❌ 未读取到有效数据，请检查文件格式。")
+                st.stop()
+
+            all_merged = pd.concat(merged_data, ignore_index=True)
+            total_students = all_merged['考号'].nunique()
             
-            progress_bar = st.progress(0)
-            total_tasks = len(download_tasks)
-            completed_tasks = 0
-            
-            for chunk_idx, chunk in enumerate(task_chunks):
-                chunk_dir = os.path.join(base_dir, f"chunk_{chunk_idx+1}")
-                os.makedirs(chunk_dir, exist_ok=True)
+        st.success(f"✅ 数据合并完成！共涵盖 **{len(all_subjects)}** 个科目，**{total_students}** 名考生。")
+
+        with st.spinner('📊 正在进行矩阵透视计算与分类...'):
+            student_list_data = generate_student_list_data(all_merged)
+            pivot_tables = create_scan_pivot_table(all_merged)
+            classification_result = classify_scan_status(all_merged)
+
+        with st.spinner('💾 正在生成精美的 Excel 报告...'):
+            # 使用内存缓冲区 BytesIO 代替本地文件
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                student_list_data.to_excel(writer, sheet_name='名单数据', index=False)
+                set_excel_cell_style_optimized(writer.sheets['名单数据'])
                 
-                # 并发流式下载到磁盘
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = [executor.submit(download_image_to_disk, t, chunk_dir) for t in chunk]
-                    for future in as_completed(futures):
-                        success, sid = future.result()
-                        if success: students_with_images.add(sid)
-                        completed_tasks += 1
-                        progress_bar.progress(completed_tasks / total_tasks, text=f"📥 极速下载中，自动分卷打包... ({completed_tasks}/{total_tasks})")
+                pivot_tables['数量透视表'].to_excel(writer, sheet_name='扫描数量透视表')
+                set_excel_cell_style_optimized(writer.sheets['扫描数量透视表'])
                 
-                # 将该文件夹打包为无压缩的 ZIP（速度极快且不吃内存）
-                zip_name = f"图片分卷下载_Part{chunk_idx+1}.zip"
-                zip_path = os.path.join(base_dir, zip_name)
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
-                    for root, _, files in os.walk(chunk_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, chunk_dir)
-                            zf.write(file_path, arcname)
-                zip_paths.append(zip_path)
+                pivot_tables['百分比透视表'].to_excel(writer, sheet_name='扫描百分比透视表')
+                set_excel_cell_style_optimized(writer.sheets['扫描百分比透视表'])
                 
-            progress_bar.empty()
-            st.success(f"✅ 图片全部打包完成！共分为 {len(zip_paths)} 个压缩包。")
-        else:
-            st.info("ℹ️ 未发现符合条件的“状态差异”试卷图片。")
+                for sheet_name, df in classification_result.items():
+                    if not df.empty:
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        set_excel_cell_style_optimized(writer.sheets[sheet_name])
+                        
+            processed_data = output.getvalue()
 
-    with st.spinner('💾 正在生成带超链接的 Excel 报告...'):
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            student_list_data.to_excel(writer, sheet_name='名单数据', index=False)
-            set_excel_cell_style_optimized(writer.sheets['名单数据'])
-            pivot_tables['数量透视表'].to_excel(writer, sheet_name='扫描数量透视表')
-            set_excel_cell_style_optimized(writer.sheets['扫描数量透视表'])
-            pivot_tables['百分比透视表'].to_excel(writer, sheet_name='扫描百分比透视表')
-            set_excel_cell_style_optimized(writer.sheets['扫描百分比透视表'])
-            
-            for sheet_name, df in classification_result.items():
-                if not df.empty:
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    ws = writer.sheets[sheet_name]
-                    set_excel_cell_style_optimized(ws)
-                    
-                    if sheet_name == '状态差异':
-                        headers = [c.value for c in ws[1]]
-                        if '已扫科目' in headers and '考号' in headers:
-                            col_idx_scanned = headers.index('已扫科目') + 1
-                            col_idx_id = headers.index('考号') + 1
-                            link_font = Font(color="0000FF", underline="single", name='微软雅黑', size=10)
-                            for row_idx in range(2, ws.max_row + 1):
-                                sid_val = str(ws.cell(row=row_idx, column=col_idx_id).value)
-                                if sid_val in students_with_images:
-                                    cell = ws.cell(row=row_idx, column=col_idx_scanned)
-                                    cell.hyperlink = f"{sid_val}/"  
-                                    cell.font = link_font
+        st.balloons()
+        st.subheader("🎉 分析完成！核心结果预览：")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ 全已扫人数", f"{len(classification_result['全已扫'])} 人")
+        col2.metric("❌ 全未扫人数", f"{len(classification_result['全未扫'])} 人")
+        col3.metric("⚠️ 状态差异人数", f"{len(classification_result['状态差异'])} 人")
 
-        st.session_state.excel_bytes = excel_buffer.getvalue()
-        st.session_state.zip_paths = zip_paths
-        st.session_state.analysis_completed = True
-
-# -------------------------- 结果展示区（利用状态常驻显示） --------------------------
-if st.session_state.get('analysis_completed'):
-    st.balloons()
-    st.subheader("🎉 分析完成！核心结果预览：")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("✅ 全已扫人数", f"{st.session_state.metrics['全已扫']} 人")
-    col2.metric("❌ 全未扫人数", f"{st.session_state.metrics['全未扫']} 人")
-    col3.metric("⚠️ 状态差异人数", f"{st.session_state.metrics['状态差异']} 人")
-
-    st.divider()
-    st.subheader("📥 下载中心")
-    
-    st.download_button(
-        label="📊 1. 点击下载完整 Excel 分析报告 (包含考号文件夹超链接)",
-        data=st.session_state.excel_bytes,
-        file_name="多科目扫描状态对比分析.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True
-    )
-    
-    if st.session_state.zip_paths:
-        st.markdown("##### 📦 试卷图片分卷下载区")
-        st.caption("💡 操作指南：请将所有 Part 下载并放置于 **同一个文件夹内（与 Excel 同级）**，然后全选压缩包 -> 右键选择 **“解压到当前文件夹”**。同考号文件夹会自动合并，Excel超链接即可完美跳转！")
-        
-        # 动态渲染分批下载按钮（因为使用了流式读取 open(zip_path)，依然不会溢出内存）
-        for idx, zip_path in enumerate(st.session_state.zip_paths):
-            with open(zip_path, "rb") as file_handle:
-                st.download_button(
-                    label=f"📦 2.{idx+1} 点击下载 图片分卷 Part {idx+1}",
-                    data=file_handle,
-                    file_name=os.path.basename(zip_path),
-                    mime="application/zip",
-                    use_container_width=True
-                )
+        st.download_button(
+            label="📥 点击下载完整 Excel 分析报告",
+            data=processed_data,
+            file_name="多科目扫描状态对比分析.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True
+        )
