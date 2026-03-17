@@ -335,37 +335,42 @@ if st.session_state.analysis_completed:
                 student_id = selected_option.split(" | ")[0].strip()
                 student_name = selected_option.split(" | ")[1].strip()
                 
-                # 获取该考生的行数据
-                row_data = diff_df[diff_df['考号'] == student_id].iloc[0]
-                scanned_subjs = str(row_data['已扫科目']).split('; ')
-                unscanned_subjs = str(row_data['未扫科目'])
+                # 【防越界修复核心代码】：强制将 DataFrame 的考号转为字符串进行精准匹配
+                matched_rows = diff_df[diff_df['考号'].astype(str) == student_id]
                 
-                # 状态标签提示
-                st.markdown(f"**考生：** `{student_name} ({student_id})` 　|　 ❌ **未扫记录：** `{unscanned_subjs}`")
-                
-                # 提取图片 URL
-                valid_images = []
-                img_mapping = st.session_state.img_mapping
-                for subj in scanned_subjs:
-                    url = img_mapping.get((student_id, subj))
-                    if url: valid_images.append((subj, url))
-                
-                if valid_images:
-                    # 动态列排版，一行最多放 3 张图
-                    cols = st.columns(len(valid_images) if len(valid_images) <= 3 else 3)
-                    for idx, (subj, url) in enumerate(valid_images):
-                        with cols[idx % 3]:
-                            st.markdown(f"##### 📄 {subj}")
-                            # 【核心黑科技】：使用 HTML 原生 <img> 标签，强制走前端浏览器渲染，彻底绕过后端内存
-                            html_img = f'''
-                            <a href="{url}" target="_blank" title="点击可全屏查看原图">
-                                <img src="{url}" style="width:100%; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border:1px solid #ddd; transition: 0.3s;"/>
-                            </a>
-                            <div style="text-align:center; margin-top:8px;">
-                                <a href="{url}" target="_blank" style="text-decoration:none; color:#4472C4; font-weight:bold;">🔗 点击在新窗口看大图</a>
-                            </div>
-                            <br>
-                            '''
-                            st.markdown(html_img, unsafe_allow_html=True)
+                if not matched_rows.empty:
+                    row_data = matched_rows.iloc[0]
+                    scanned_subjs = str(row_data['已扫科目']).split('; ')
+                    unscanned_subjs = str(row_data['未扫科目'])
+                    
+                    # 状态标签提示
+                    st.markdown(f"**考生：** `{student_name} ({student_id})` 　|　 ❌ **未扫记录：** `{unscanned_subjs}`")
+                    
+                    # 提取图片 URL
+                    valid_images = []
+                    img_mapping = st.session_state.img_mapping
+                    for subj in scanned_subjs:
+                        url = img_mapping.get((student_id, subj))
+                        if url: valid_images.append((subj, url))
+                    
+                    if valid_images:
+                        # 动态列排版，一行最多放 3 张图
+                        cols = st.columns(len(valid_images) if len(valid_images) <= 3 else 3)
+                        for idx, (subj, url) in enumerate(valid_images):
+                            with cols[idx % 3]:
+                                st.markdown(f"##### 📄 {subj}")
+                                # 使用 HTML 原生 <img> 标签，强制走前端浏览器渲染，彻底绕过后端内存
+                                html_img = f'''
+                                <a href="{url}" target="_blank" title="点击可全屏查看原图">
+                                    <img src="{url}" style="width:100%; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border:1px solid #ddd; transition: 0.3s;"/>
+                                </a>
+                                <div style="text-align:center; margin-top:8px;">
+                                    <a href="{url}" target="_blank" style="text-decoration:none; color:#4472C4; font-weight:bold;">🔗 点击在新窗口看大图</a>
+                                </div>
+                                <br>
+                                '''
+                                st.markdown(html_img, unsafe_allow_html=True)
+                    else:
+                        st.warning("⚠️ 该考生暂无匹配的试卷第一页图片。")
                 else:
-                    st.warning("⚠️ 该考生暂无匹配的试卷第一页图片。")
+                    st.error("⚠️ 未能匹配到该考生的详细数据，请重新选择。")
