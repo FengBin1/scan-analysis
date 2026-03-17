@@ -247,8 +247,9 @@ def parse_txt_mappings(txt_files):
         
         for line in content:
             if '\t' not in line: continue
-            url, local_path = line.split('\t')
-            url = url.strip()
+            # 【关键修复 1】：限制分割次数，并剥离 URL 外侧可能自带的单双引号
+            url, local_path = line.split('\t', 1)
+            url = url.strip().strip('"').strip("'")  
             local_path = local_path.strip().replace('/', '\\')
             parts = local_path.split('\\')
             
@@ -285,11 +286,14 @@ def generate_download_scripts(download_tasks):
     ]
     
     for url, sid, subj in download_tasks:
+        # 【关键修复 2】：在 Windows 批处理中，URL里的 "%" 必须转义为 "%%"，防止被当成变量导致链接截断
+        safe_bat_url = url.replace('%', '%%')
+        
         # Windows命令
         bat_lines.append(f'if not exist "{sid}" mkdir "{sid}"')
-        bat_lines.append(f'curl -s -o "{sid}\\{subj}.jpg" "{url}"')
+        bat_lines.append(f'curl -s -o "{sid}\\{subj}.jpg" "{safe_bat_url}"')
         
-        # Mac命令
+        # Mac命令 (Shell脚本不需要转义%)
         sh_lines.append(f'mkdir -p "{sid}"')
         sh_lines.append(f'curl -s -o "{sid}/{subj}.jpg" "{url}"')
         
