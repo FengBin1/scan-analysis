@@ -5,7 +5,6 @@ import os
 import re
 import io
 import warnings
-import requests
 import zipfile
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, NamedStyle
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -148,7 +147,6 @@ def classify_scan_status(all_merged_data):
     status_summary = status_summary.merge(status_list, on='考号', how='left')
     status_summary['涉及科目数'] = status_summary['科目'].str.count(',') + 1
     
-    # 【改动】新增 '考号' 到 final_cols，作为唯一标识关联图片文件夹使用
     final_cols = ['考号', '学校', '姓名', '学号', '班级', '科目', '涉及科目数', '已扫科目', '未扫科目', '扫描状态', '扫描状态分类']
     return {
         '全已扫': status_summary[status_summary['扫描状态分类'] == '全已扫'][final_cols],
@@ -221,7 +219,7 @@ def set_excel_cell_style_optimized(ws):
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
 
-# -------------------------- 新增：TXT 解析与下载函数 --------------------------
+# -------------------------- 新增：TXT 解析与脚本生成函数 --------------------------
 def parse_txt_mappings(txt_files):
     """解析 TXT 文件，提取 (考号, 科目) -> URL 的映射"""
     mapping = {}
@@ -229,7 +227,6 @@ def parse_txt_mappings(txt_files):
     
     for f in txt_files:
         content = f.getvalue().decode('utf-8', errors='ignore').splitlines()
-        # 1. 探查当前文件的科目代码 (防重复处理)
         file_subject_code = None
         for line in content:
             if '\t' in line:
@@ -248,7 +245,6 @@ def parse_txt_mappings(txt_files):
         processed_subjects.add(file_subject_code)
         subject_name = SUBJECT_CODE_MAP.get(file_subject_code, f"未知科目_{file_subject_code}")
         
-        # 2. 正式解析内容
         for line in content:
             if '\t' not in line: continue
             url, local_path = line.split('\t')
@@ -265,30 +261,57 @@ def parse_txt_mappings(txt_files):
                     
     return mapping
 
-def download_image(task):
-    url, sid, subj = task
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return sid, subj, resp.content
-    except Exception:
-        pass
-    return sid, subj, None
+def generate_download_scripts(download_tasks):
+    """根据任务生成本地专用的批处理/Shell下载脚本"""
+    # 1. Windows 版 (.bat)
+    bat_lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        "title 试卷图片批量下载工具",
+        "echo ==========================================",
+        "echo      正在为您批量下载试卷图片，请稍候...",
+        "echo      (请保持网络畅通，黑框消失即为下载完成)",
+        "echo ==========================================",
+        "echo."
+    ]
+    
+    # 2. Mac/Linux 版 (.sh)
+    sh_lines = [
+        "#!/bin/bash",
+        "echo '=========================================='",
+        "echo '     正在为您批量下载试卷图片，请稍候...'",
+        "echo '=========================================='",
+        "echo ''"
+    ]
+    
+    for url, sid, subj in download_tasks:
+        # Windows命令
+        bat_lines.append(f'if not exist "{sid}" mkdir "{sid}"')
+        bat_lines.append(f'curl -s -o "{sid}\\{subj}.jpg" "{url}"')
+        
+        # Mac命令
+        sh_lines.append(f'mkdir -p "{sid}"')
+        sh_lines.append(f'curl -s -o "{sid}/{subj}.jpg" "{url}"')
+        
+    bat_lines.extend(["echo.", "echo ✅ 所有图片下载完成！请在当前目录下查看。文件夹均以考号命名。", "pause"])
+    sh_lines.extend(["echo ''", "echo '✅ 所有图片下载完成！'", "read -p '按回车键退出...'"])
+    
+    return "\n".join(bat_lines), "\n".join(sh_lines)
 
 # -------------------------- Streamlit 网页前端逻辑 --------------------------
 st.title("🚀 多科目考生扫描状态对比分析工具")
-st.markdown("上传包含各科目扫描数据的 Excel 文件，一键生成合并分析报告。**（数据仅在内存中处理，绝对安全）**")
+st.markdown("上传包含各科目扫描数据的 Excel 文件，一键生成合并分析报告。**（防崩溃优化版：图片通过本地脚本极速下载）**")
 
 # UI：Excel文件上传
 uploaded_files = st.file_uploader("请选择所有需要对比的科目 Excel 文件（至少2个）", type=['xlsx', 'xls'], accept_multiple_files=True)
 
 # UI：图片下载与超链接选项
 st.divider()
-enable_img_download = st.checkbox("🧩 启用试卷图片下载与 Excel 超链接功能（可选）", help="勾选后可上传 TXT 文件，系统将为“状态差异”中的考生自动下载缺失的第一页图片并打包生成ZIP。")
+enable_img_download = st.checkbox("🧩 启用试卷图片下载与 Excel 超链接功能（可选）", help="为了防止服务器崩溃，勾选后将生成一个极小的 ZIP 压缩包，内含 Excel 表格和「一键下载脚本」。")
 
 txt_files = []
 if enable_img_download:
-    st.info("💡 提示：请上传带有 OSS 链接和本地路径映射的 TXT 文件。工具将为您合并生成包含图片的 ZIP 压缩包。")
+    st.info("💡 提示：请上传图片映射 TXT 文件。系统会为您生成本地下载脚本，双击即可极速批量下载图片到对应文件夹！")
     txt_files = st.file_uploader("📂 请上传科目图片映射 TXT 文件", type=['txt'], accept_multiple_files=True)
 
 if st.button("开始极速分析", type="primary"):
@@ -296,12 +319,10 @@ if st.button("开始极速分析", type="primary"):
         st.warning("⚠️ 至少需要上传 2 个 Excel 文件才能进行对比！")
         st.stop()
         
-    # 处理开启了功能但没有上传TXT的情况
     if enable_img_download and not txt_files:
         st.warning("⚠️ 启用了图片下载功能但未检测到TXT文件，将仅输出原有Excel报告。")
         enable_img_download = False
 
-    # 1. 解析合并 Excel 数据
     with st.spinner('🚀 正在多线程读取数据...'):
         merged_data = []
         all_subjects = []
@@ -323,7 +344,6 @@ if st.button("开始极速分析", type="primary"):
         
     st.success(f"✅ 数据合并完成！共涵盖 **{len(all_subjects)}** 个科目，**{total_students}** 名考生。")
 
-    # 2. 生成透视与分类数据
     with st.spinner('📊 正在进行矩阵透视计算与分类...'):
         student_list_data = generate_student_list_data(all_merged)
         pivot_tables = create_scan_pivot_table(all_merged)
@@ -335,12 +355,12 @@ if st.button("开始极速分析", type="primary"):
     processed_data = None
     
     if enable_img_download and txt_files:
-        st.info("🔗 开始解析 TXT 并匹配图片链接...")
+        st.info("🔗 正在分析图片链接，生成零内存占用的本地下载方案...")
         img_mapping = parse_txt_mappings(txt_files)
         
-        # 筛选下载任务（只匹配：状态差异中、且已扫的科目图片）
         diff_df = classification_result['状态差异']
         download_tasks = []
+        students_with_images = set()
         
         for _, row in diff_df.iterrows():
             student_id = str(row['考号'])
@@ -349,37 +369,23 @@ if st.button("开始极速分析", type="primary"):
                 key = (student_id, subj)
                 if key in img_mapping:
                     download_tasks.append((img_mapping[key], student_id, subj))
+                    students_with_images.add(student_id)
         
         zip_buffer = io.BytesIO()
-        students_with_images = set()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # 下载图片写入 ZIP
             if download_tasks:
-                progress_text = "📥 正在极速并发下载试卷图片..."
-                my_bar = st.progress(0, text=progress_text)
-                completed = 0
-                total_tasks = len(download_tasks)
-                
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = [executor.submit(download_image, t) for t in download_tasks]
-                    for future in as_completed(futures):
-                        sid, subj, img_data = future.result()
-                        if img_data:
-                            zf.writestr(f"{sid}/{subj}.jpg", img_data)  # 考号建文件夹, 中文科目命名
-                            students_with_images.add(sid)
-                        completed += 1
-                        my_bar.progress(completed / total_tasks, text=f"{progress_text} ({completed}/{total_tasks})")
-                my_bar.empty()
-                st.success(f"✅ 图片下载完成！共成功下载 **{len(students_with_images)}** 名考生的图片。")
+                # 方案：生成批量下载脚本，杜绝服务器崩溃
+                bat_script, sh_script = generate_download_scripts(download_tasks)
+                zf.writestr("【Windows】双击一键下载缺失图片.bat", bat_script.encode('utf-8'))
+                zf.writestr("【Mac】双击一键下载缺失图片.command", sh_script.encode('utf-8'))
+                st.success(f"✅ 已为您生成下载脚本！(涉及 {len(download_tasks)} 张缺失图片) \n👉 解压后双击脚本，您的电脑就会自动建文件夹并下载图片。")
             else:
-                st.info("ℹ️ TXT文件匹配完成，但未发现符合条件的“状态差异”试卷图片。")
+                st.info("ℹ️ 未发现符合条件的“状态差异”试卷图片，无须下载。")
                 
-            # 生成 Excel 并加入超链接
             with st.spinner('💾 正在生成带超链接的 Excel 报告...'):
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    # 写入各 sheet
                     student_list_data.to_excel(writer, sheet_name='名单数据', index=False)
                     set_excel_cell_style_optimized(writer.sheets['名单数据'])
                     
@@ -395,7 +401,6 @@ if st.button("开始极速分析", type="primary"):
                             ws = writer.sheets[sheet_name]
                             set_excel_cell_style_optimized(ws)
                             
-                            # 插入 Option B：针对“状态差异”表的已扫科目添加相对路径超链接
                             if sheet_name == '状态差异':
                                 headers = [c.value for c in ws[1]]
                                 if '已扫科目' in headers and '考号' in headers:
@@ -407,17 +412,18 @@ if st.button("开始极速分析", type="primary"):
                                         sid_val = str(ws.cell(row=row_idx, column=col_idx_id).value)
                                         if sid_val in students_with_images:
                                             cell = ws.cell(row=row_idx, column=col_idx_scanned)
-                                            cell.hyperlink = f"{sid_val}/"  # 指向 ZIP 解压后的该考生同级目录
+                                            # 指向本地脚本创建的该考生同级目录
+                                            cell.hyperlink = f"{sid_val}/"  
                                             cell.font = link_font
                                             
-                zf.writestr("多科目扫描状态对比分析.xlsx", excel_buffer.getvalue())
+                zf.writestr("多科目扫描状态对比分析(带链接版).xlsx", excel_buffer.getvalue())
                 
         processed_data = zip_buffer.getvalue()
-        output_file_name = "多科目分析报告及试卷图片.zip"
+        output_file_name = "【请解压】多科目分析报告及本地下载工具.zip"
         output_mime_type = "application/zip"
 
     else:
-        # 原逻辑：仅生成纯净版 Excel
+        # 纯净版 Excel 逻辑
         with st.spinner('💾 正在生成精美的 Excel 报告...'):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -444,8 +450,7 @@ if st.button("开始极速分析", type="primary"):
     col2.metric("❌ 全未扫人数", f"{len(classification_result['全未扫'])} 人")
     col3.metric("⚠️ 状态差异人数", f"{len(classification_result['状态差异'])} 人")
 
-    # 动态渲染下载按钮 (ZIP包或单Excel文件)
-    btn_label = "📥 点击一键下载分析报告及试卷图片 (ZIP压缩包)" if enable_img_download and txt_files else "📥 点击下载完整 Excel 分析报告"
+    btn_label = "📥 点击下载包含本地批量下载工具的压缩包" if enable_img_download and txt_files else "📥 点击下载完整 Excel 分析报告"
     st.download_button(
         label=btn_label,
         data=processed_data,
