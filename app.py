@@ -21,7 +21,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 # 禁用不安全请求警告
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
-# -------------------------- 网络请求核心 & 性能优化 --------------------------
 # 创建自定义SSL上下文
 class CustomSSLAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
@@ -38,16 +37,11 @@ class CustomSSLAdapter(requests.adapters.HTTPAdapter):
             ssl_context=context
         )
 
-# 【性能优化】全局 Session 缓存 (复用连接池提升 30% 以上网络速度)
-@st.cache_resource
-def get_api_session():
-    session = requests.Session()
-    session.mount('https://', CustomSSLAdapter())
-    return session
-
 # -------------------------- 全局常量 & 样式定义 --------------------------
 # 科目代码映射，将从API获取
-SUBJECT_CODE_MAP = {}
+SUBJECT_CODE_MAP = {
+    
+}
 
 header_style = NamedStyle(name="header_style")
 header_style.font = Font(name='微软雅黑', size=11, bold=True, color='FFFFFF')
@@ -89,41 +83,71 @@ if 'analysis_completed' not in st.session_state:
 
 # -------------------------- API 相关函数 --------------------------
 def login(username, password):
+    """
+    登录系统获取token
+    :param username: 登录手机号
+    :param password: 登录密码
+    :return: token字符串
+    """
     login_url = "https://www.txdat.net/auth"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Referer": "https://www.txdat.net/login",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
     }
-    login_data = {"Username": username, "Password": password}
+    
+    login_data = {
+        "Username": username,
+        "Password": password
+    }
     
     response = requests.post(
-        url=login_url, headers=headers, data=login_data,
-        allow_redirects=False, verify=False
+        url=login_url,
+        headers=headers,
+        data=login_data,
+        allow_redirects=False,
+        verify=False
     )
     
+    # 提取Token
     token = None
     set_cookie_header = response.headers.get("set-cookie", "")
+    
+    # 处理set_cookie_header可能是列表的情况
     if isinstance(set_cookie_header, list):
         set_cookie_header = ", ".join(set_cookie_header)
     
     for cookie in set_cookie_header.split(", "):
         if cookie.startswith("token="):
+            # 修复分割逻辑
             token_part = cookie.split(";").pop(0)
             token = token_part.split("=")[1]
             break
+    
     return token
 
 def call_api(token, endpoint, method="GET", data=None, is_json=False):
+    """
+    调用API接口
+    :param token: 认证token
+    :param endpoint: API端点
+    :param method: 请求方法
+    :param data: 请求数据
+    :param is_json: 是否以JSON格式发送数据
+    :return: 响应数据
+    """
     api_url = f"https://api.txdat.net{endpoint}"
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
     }
+    
     if is_json:
         headers["Content-Type"] = "application/json"
     
-    session = get_api_session()
+    # 创建会话并使用自定义SSL适配器
+    session = requests.Session()
+    session.mount('https://', CustomSSLAdapter())
     
     try:
         if method.upper() == "GET":
@@ -134,80 +158,162 @@ def call_api(token, endpoint, method="GET", data=None, is_json=False):
             else:
                 response = session.post(api_url, headers=headers, data=data, verify=False, timeout=30)
         
-        response.raise_for_status()
+        response.raise_for_status()  # 检查响应状态码
         return response.json()
     except requests.exceptions.RequestException as e:
         st.error(f"API调用失败: {str(e)}")
         return None
 
-# 【性能优化】使用 @st.cache_data 缓存静态接口，避免重复请求
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_schools(token):
+    """
+    获取学校列表
+    :param token: 认证token
+    :return: 学校列表
+    """
     return call_api(token, "/school/schools")
 
-@st.cache_data(ttl=300, show_spinner=False)
 def get_exams(token, schoolid, status=-1):
+    """
+    获取考试列表
+    :param token: 认证token
+    :param schoolid: 学校ID
+    :param status: 状态 (-1: 全部, 0: 未结束, 1: 已结束)
+    :return: 考试列表
+    """
     return call_api(token, "/exam/exams", data={"schoolid": schoolid, "status": status})
 
 def get_exam_courses(token, examgroup):
+    """
+    获取考试科目列表
+    :param token: 认证token
+    :param examgroup: 考试组号
+    :return: 科目列表
+    """
     return call_api(token, "/exam/courses", data={"examgroup": examgroup})
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_system_courses(token, schoolid):
+    """
+    获取系统内置的所有科目信息
+    :param token: 认证token
+    :param schoolid: 学校ID
+    :return: 科目列表
+    """
     return call_api(token, "/course/list", data={"schoolid": schoolid})
 
 def get_exam_students(token, examid, limit=10000):
+    """
+    获取考试学生列表
+    :param token: 认证token
+    :param examid: 考试ID
+    :param limit: 每页数量
+    :return: 学生列表
+    """
+    # 分页获取所有学生数据
     all_students = []
     offset = 0
+    
     while True:
+        # 使用浏览器中的参数
         students = call_api(token, "/student/exam/query", data={
-            "sort": "code", "order": "asc", "offset": offset, "limit": limit,
-            "examid": examid, "groupid": 0, "column": "code", "value": "",
-            "isscan": -1, "isupload": -1
+            "sort": "code",
+            "order": "asc",
+            "offset": offset,
+            "limit": limit,
+            "examid": examid,
+            "groupid": 0,
+            "column": "code",
+            "value": "",
+            "isscan": -1,
+            "isupload": -1
         })
-        if students is None: break
         
+        if students is None:
+            break
+        
+        # 处理students可能是字典的情况
         if isinstance(students, dict):
-            if 'students' in students: students = students['students']
-            elif 'data' in students: students = students['data']
-            elif 'items' in students: students = students['items']
-            elif 'list' in students: students = students['list']
+            # 尝试从字典中提取学生列表
+            if 'students' in students:
+                students = students['students']
+            elif 'data' in students:
+                students = students['data']
+            elif 'items' in students:
+                students = students['items']
+            elif 'list' in students:
+                students = students['list']
             else:
+                # 尝试查找可能包含学生数据的键
                 for key, value in students.items():
                     if isinstance(value, list):
-                        students = value; break
-                else: break
+                        students = value
+                        break
+                else:
+                    break
         
-        if not isinstance(students, list) or not students: break
+        if not isinstance(students, list):
+            break
+        
+        if not students:
+            break
+        
         all_students.extend(students)
         offset += limit
     
     return all_students
 
 def get_image_links(token, examid):
+    """
+    获取考试相关图片链接
+    :param token: 认证token
+    :param examid: 考试ID
+    :return: 图片链接列表，每个元素包含link和upload_path
+    """
     try:
+        # 下载包含链接的txt文件
         url = f"https://api.txdat.net/file/text/downimg"
-        params = {"token": token, "examid": examid}
+        params = {
+            "token": token,
+            "examid": examid
+        }
         
-        session = get_api_session()
+        # 创建会话并使用自定义SSL适配器
+        session = requests.Session()
+        session.mount('https://', CustomSSLAdapter())
+        
         response = session.get(url, params=params, verify=False, timeout=30)
         response.raise_for_status()
         
+        # 读取txt文件内容，获取下载链接
         content = response.text.strip()
+        
+        # 处理下载链接，清理特殊字符和额外信息
         links_info = []
         for line in content.split('\n'):
+            # 清理链接
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             
+            # 分割链接和上传路径
             parts = line.split('\t')
             if len(parts) >= 2:
-                link = parts[0].strip().replace('%09', '').replace('%0D', '')
+                link = parts[0].strip()
                 upload_path = parts[1].strip()
+                # 清理URL中的特殊字符
+                link = link.replace('%09', '').replace('%0D', '')
                 links_info.append({"link": link, "upload_path": upload_path})
             elif line.startswith('http://') or line.startswith('https://'):
-                link = line.split('\r')[0].replace('%09', '').replace('%0D', '')
+                # 只保留URL部分，去除回车符
+                link = line.split('\r')[0]
+                # 清理URL中的特殊字符
+                link = link.replace('%09', '').replace('%0D', '')
                 links_info.append({"link": link, "upload_path": ""})
         
+        if not links_info:
+            st.warning("未找到有效的下载链接")
+            return []
+        st.success(f"获取到 {len(links_info)} 个图片链接")
+        # 静默处理，不输出链接信息
         return links_info
     except Exception as e:
         st.error(f"获取图片链接失败: {str(e)}")
@@ -215,19 +321,41 @@ def get_image_links(token, examid):
 
 # -------------------------- 核心工具函数 --------------------------
 def process_student_data(students, course_name):
-    if not students: return pd.DataFrame()
+    """
+    处理学生数据，转换为DataFrame
+    :param students: 学生列表
+    :param course_name: 科目名称
+    :return: 处理后的DataFrame
+    """
+    if not students:
+        return pd.DataFrame()
+    
+    # 转换为DataFrame
     df = pd.DataFrame(students)
+    
+    # 重命名和处理字段
     df = df.rename(columns={
-        'code': '考号', 'name': '姓名', 'schoolname': '学校',
-        'classroom': '班级', 'studid': '学号', 'scandone': '扫描状态'
+        'code': '考号',
+        'name': '姓名',
+        'schoolname': '学校',
+        'classroom': '班级',
+        'studid': '学号',
+        'scandone': '扫描状态'
     })
+    
+    # 处理扫描状态
     scan_status_map = {'True': '已扫', 'False': '未扫', '1': '已扫', '0': '未扫', '是': '已扫', '否': '未扫', '已扫': '已扫', '未扫': '未扫', '': '未扫', '未记录': '未记录'}
     df['扫描状态'] = df['扫描状态'].astype(str).str.strip().replace(scan_status_map).fillna('未记录')
+    
+    # 添加科目列
     df['科目'] = course_name
     
+    # 确保必要的列存在
     required_cols = ['考号', '姓名', '学校', '班级', '学号', '扫描状态', '科目']
     for col in required_cols:
-        if col not in df.columns: df[col] = '未记录'
+        if col not in df.columns:
+            df[col] = '未记录'
+    
     return df[required_cols]
 
 def generate_student_list_data(all_merged_data):
@@ -248,13 +376,9 @@ def classify_scan_status(all_merged_data):
     is_unscanned = all_merged_data['扫描状态'] == '未扫'
     is_unrecorded = all_merged_data['扫描状态'] == '未记录'
 
-    # 【性能优化】使用内置 agg 加速字符串拼接
-    scanned_subj = all_merged_data[is_scanned].groupby('考号')['科目'].agg('; '.join).rename('已扫科目')
-    unscanned_subj = all_merged_data[is_unscanned].groupby('考号')['科目'].agg('; '.join).rename('未扫_纯')
-    
-    unrecorded_df = all_merged_data[is_unrecorded].copy()
-    unrecorded_df['科目'] = unrecorded_df['科目'].astype(str) + "(未记录)"
-    unrecorded_subj = unrecorded_df.groupby('考号')['科目'].agg('; '.join).rename('未扫_记录')
+    scanned_subj = all_merged_data[is_scanned].groupby('考号')['科目'].apply(lambda x: '; '.join(x)).rename('已扫科目')
+    unscanned_subj = all_merged_data[is_unscanned].groupby('考号')['科目'].apply(lambda x: '; '.join(x)).rename('未扫_纯')
+    unrecorded_subj = all_merged_data[is_unrecorded].groupby('考号')['科目'].apply(lambda x: '; '.join([f"{s}(未记录)" for s in x])).rename('未扫_记录')
 
     df_subj = pd.DataFrame(index=status_summary['考号']).join(scanned_subj).join(unscanned_subj).join(unrecorded_subj)
     df_subj['已扫科目'] = df_subj['已扫科目'].fillna('无')
@@ -266,7 +390,8 @@ def classify_scan_status(all_merged_data):
 
     counts = all_merged_data.pivot_table(index='考号', columns='扫描状态', values='科目', aggfunc='count', fill_value=0, observed=False)
     for col in ['已扫', '未扫', '未记录']:
-        if col not in counts.columns: counts[col] = 0
+        if col not in counts.columns:
+            counts[col] = 0
             
     total_valid = counts['已扫'] + counts['未扫']
     conditions = [total_valid == 0, (counts['已扫'] > 0) & (counts['未扫'] == 0), (counts['未扫'] > 0) & (counts['已扫'] == 0)]
@@ -283,13 +408,48 @@ def classify_scan_status(all_merged_data):
         '状态未记录': status_summary[status_summary['扫描状态分类'] == '状态未记录'][final_cols]
     }
 
+def create_scan_pivot_table(all_merged_data):
+    pivot_data = all_merged_data.copy()
+    pivot_data['是否已扫'] = pivot_data['扫描状态'] == '已扫'
+    
+    total_pivot = pd.pivot_table(pivot_data, index='学校', columns='科目', values='考号', aggfunc='count', fill_value=0, observed=False)
+    scanned_pivot = pd.pivot_table(pivot_data[pivot_data['是否已扫']], index='学校', columns='科目', values='考号', aggfunc='count', fill_value=0, observed=False)
+    
+    all_schools, all_subjects = total_pivot.index.union(scanned_pivot.index), total_pivot.columns.union(scanned_pivot.columns)
+    total_pivot, scanned_pivot = total_pivot.reindex(index=all_schools, columns=all_subjects, fill_value=0), scanned_pivot.reindex(index=all_schools, columns=all_subjects, fill_value=0)
+    
+    result_pivot = scanned_pivot.astype(str) + '/' + total_pivot.astype(str)
+    percentage_pivot = pd.DataFrame(np.where(total_pivot > 0, (scanned_pivot / total_pivot) * 100, 0.0), index=all_schools, columns=all_subjects).applymap(lambda x: f"{x:.1f}%")
+    
+    row_scanned, row_total = scanned_pivot.sum(axis=1), total_pivot.sum(axis=1)
+    result_pivot['总计'] = row_scanned.astype(str) + '/' + row_total.astype(str)
+    percentage_pivot['总计'] = [f"{x:.1f}%" for x in np.where(row_total > 0, (row_scanned / row_total) * 100, 0.0)]
+    
+    col_scanned, col_total = scanned_pivot.sum(axis=0), total_pivot.sum(axis=0)
+    col_scanned['总计'], col_total['总计'] = col_scanned.sum(), col_total.sum()
+    
+    result_pivot.loc['总计'] = col_scanned.astype(str) + '/' + col_total.astype(str)
+    percentage_pivot.loc['总计'] = [f"{x:.1f}%" for x in np.where(col_total > 0, (col_scanned / col_total) * 100, 0.0)]
+    
+    result_pivot = result_pivot.rename_axis('学校').reset_index()
+    percentage_pivot = percentage_pivot.rename_axis('学校').reset_index()
+    
+    return {'数量透视表': result_pivot, '百分比透视表': percentage_pivot}
+
 def parse_image_mappings(links_info_list, course_names):
+    """
+    解析图片映射信息
+    :param links_info_list: 图片链接列表
+    :param course_names: 科目名称列表
+    :return: 图片映射字典
+    """
     mapping = {}
     for links_info, course_name in zip(links_info_list, course_names):
         for item in links_info:
             link = item.get('link', '')
             upload_path = item.get('upload_path', '')
             if link and upload_path:
+                # 从上传路径中提取学生信息
                 parts = upload_path.split('\\')
                 if len(parts) >= 3 and '(1)' in parts[-1]:
                     student_dir = parts[-2]
@@ -297,68 +457,60 @@ def parse_image_mappings(links_info_list, course_names):
                     mapping[(student_id, course_name)] = link
     return mapping
 
-# 【性能优化】大幅优化的 Excel 样式渲染函数
 def set_excel_cell_style_optimized(ws):
-    headers = []
     for cell in ws[1]:
         cell.style = header_style
-        headers.append(cell.value)
-    
-    max_row = ws.max_row
-    max_col = ws.max_column
-    
+    max_row, max_col, headers = ws.max_row, ws.max_column, [cell.value for cell in ws[1]]
     center_cols_idx = {i for i, h in enumerate(headers) if h in ['涉及科目数', '扫描状态分类', '考号', '学号', '处理进度']}
     if '学校' in headers and max_row >= 2:
         center_cols_idx = set(range(max_col))
-        
-    status_col_idx = headers.index('处理进度') + 1 if '处理进度' in headers else -1
-
-    for col_idx, col in enumerate(ws.columns):
-        col_letter = col[0].column_letter
-        header_val = str(col[0].value) if col[0].value else ""
-        
-        is_center = col_idx in center_cols_idx
-        target_style = center_data_style if is_center else data_style
-        
-        # 批量样式设置，规避昂贵的循环判断
-        for cell in col[1:]: 
-            if status_col_idx != -1 and col_idx == status_col_idx - 1 and getattr(cell, 'value', None) == '已标记':
+    
+    for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
+        for idx, cell in enumerate(row):
+            if headers[idx] == '处理进度' and cell.value == '已标记':
                 cell.font = Font(name='微软雅黑', size=10, color='008000', bold=True)
                 cell.alignment = Alignment(horizontal='center', vertical='center')
                 cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             else:
-                cell.style = target_style
-
-        # 抽样计算最大列宽 (仅看前 50 行)
-        sample_cells = [cell for cell in col[:50] if cell.value]
-        max_len = 0
-        for cell in sample_cells:
-            val = str(cell.value)
-            length = len(val.encode('gbk', errors='ignore'))
-            if length > max_len: max_len = length
-            
-        width = min(max_len + 2, 40) if '科目' in header_val and '数' not in header_val else min(max_len + 2, 20)
-        if '总计' in header_val or '学校' in header_val: width = min(max_len + 2, 20)
-        ws.column_dimensions[col_letter].width = max(width, 10)
+                cell.style = center_data_style if idx in center_cols_idx else data_style
+    
+    for col in ws.columns:
+        col_letter, header_val = col[0].column_letter, str(col[0].value) if col[0].value else ""
+        max_len = max([len(str(cell.value)) for cell in col[:100] if cell.value] or [0])
+        width = min(max_len + 4, 40) if '科目' in header_val and '数' not in header_val else min(max_len + 3, 20) if '总计' in header_val or '学校' in header_val else min(max_len + 3, 15)
+        ws.column_dimensions[col_letter].width = width
 
 def generate_latest_excel():
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # 只包含需要的四张表
+        # 1. 名单数据
         if '名单数据' in st.session_state.report_sheets:
-            st.session_state.report_sheets['名单数据'].to_excel(writer, sheet_name='名单', index=False)
+            df = st.session_state.report_sheets['名单数据']
+            df.to_excel(writer, sheet_name='名单', index=False)
             set_excel_cell_style_optimized(writer.sheets['名单'])
+        
+        # 2. 全已扫
         if '全已扫' in st.session_state.report_sheets:
-            st.session_state.report_sheets['全已扫'].to_excel(writer, sheet_name='全已扫', index=False)
+            df = st.session_state.report_sheets['全已扫']
+            df.to_excel(writer, sheet_name='全已扫', index=False)
             set_excel_cell_style_optimized(writer.sheets['全已扫'])
+        
+        # 3. 全未扫
         if '全未扫' in st.session_state.report_sheets:
-            st.session_state.report_sheets['全未扫'].to_excel(writer, sheet_name='全未扫', index=False)
+            df = st.session_state.report_sheets['全未扫']
+            df.to_excel(writer, sheet_name='全未扫', index=False)
             set_excel_cell_style_optimized(writer.sheets['全未扫'])
+        
+        # 4. 差异表
         if not st.session_state.diff_df.empty:
-            st.session_state.diff_df.to_excel(writer, sheet_name='状态差异', index=False)
+            df = st.session_state.diff_df
+            df.to_excel(writer, sheet_name='状态差异', index=False)
             set_excel_cell_style_optimized(writer.sheets['状态差异'])
     st.session_state.excel_bytes = output.getvalue()
 
 # -------------------------- Streamlit 网页前端逻辑 --------------------------
+st.set_page_config(page_title="多科目异常追踪系统", page_icon="🎯", layout="wide")
 st.title("🎯 多科目异常追踪与极速打标系统")
 st.markdown("不仅永久记忆您的标记，更引入了**「快捷键翻页」「快捷标签秒杀」与「按校批量处理」**三大效率神器！")
 
@@ -388,6 +540,7 @@ if not st.session_state.token:
     if login_choice == "使用用户名密码登录":
         username = st.text_input("登录手机号:")
         password = st.text_input("登录密码:", type="password")
+        
         if st.button("登录", type="primary"):
             if not username or not password:
                 st.warning("请输入用户名和密码")
@@ -402,32 +555,40 @@ if not st.session_state.token:
                         st.error("登录失败，无法获取token")
     else:
         token = st.text_input("请输入token:")
+        
         if st.button("确认", type="primary"):
-            if not token: st.warning("token不能为空")
+            if not token:
+                st.warning("token不能为空")
             else:
                 st.session_state.token = token
                 st.success("已输入token")
                 st.rerun()
 else:
+    # 上传历史标记报告
     st.subheader("📤 上传历史标记报告 (可选)")
     history_file = st.file_uploader("上传上次导出的本系统标记报告", type=['xlsx', 'xls'], accept_multiple_files=False)
     
+    # 获取学校列表
     if not st.session_state.schools:
         with st.spinner("正在获取学校列表..."):
             schools = get_schools(st.session_state.token)
-            if schools: st.session_state.schools = schools
+            if schools:
+                st.session_state.schools = schools
             else:
                 st.error("未获取到学校列表")
                 st.session_state.token = None
                 st.rerun()
     
+    # 选择学校
     if st.session_state.schools:
         school_names = [school['schoolname'] for school in st.session_state.schools]
         selected_school_name = st.selectbox("选择学校:", school_names)
         selected_school = next((school for school in st.session_state.schools if school['schoolname'] == selected_school_name), None)
         
         if selected_school:
+            # 检查是否切换了学校
             if st.session_state.selected_school is None or st.session_state.selected_school['schoolid'] != selected_school['schoolid']:
+                # 重置考试相关状态
                 st.session_state.selected_school = selected_school
                 st.session_state.exams = []
                 st.session_state.selected_exam = None
@@ -435,39 +596,56 @@ else:
                 st.session_state.selected_courses = []
                 st.session_state.analysis_completed = False
                 
+                # 获取系统内置科目信息，更新SUBJECT_CODE_MAP
                 with st.spinner("正在获取系统科目信息..."):
                     system_courses = get_system_courses(st.session_state.token, selected_school['schoolid'])
                     if system_courses:
-                        new_subject_map = {str(course['courseid']).zfill(2): course['coursename'] for course in system_courses}
+                        # 构建科目代码映射
+                        new_subject_map = {}
+                        for course in system_courses:
+                            # 将courseid转换为两位数字符串
+                            course_id_str = str(course['courseid']).zfill(2)
+                            new_subject_map[course_id_str] = course['coursename']
+                        # 更新全局变量
                         SUBJECT_CODE_MAP = new_subject_map
                         st.success("成功获取系统科目信息")
                     else:
                         st.warning("未获取到系统科目信息，使用默认科目映射")
             
+            # 获取考试列表
             if not st.session_state.exams:
                 with st.spinner("正在获取考试列表..."):
                     exams = get_exams(st.session_state.token, selected_school['schoolid'])
-                    if exams: st.session_state.exams = exams
-                    else: st.error("未获取到考试列表")
+                    if exams:
+                        st.session_state.exams = exams
+                    else:
+                        st.error("未获取到考试列表")
             
+            # 选择考试
             if st.session_state.exams:
                 exam_names = [exam['examname'] for exam in st.session_state.exams]
                 selected_exam_name = st.selectbox("选择考试:", exam_names)
                 selected_exam = next((exam for exam in st.session_state.exams if exam['examname'] == selected_exam_name), None)
                 
                 if selected_exam:
+                    # 检查是否切换了考试
                     if st.session_state.selected_exam is None or st.session_state.selected_exam['examgroup'] != selected_exam['examgroup']:
+                        # 重置科目相关状态
                         st.session_state.selected_exam = selected_exam
                         st.session_state.courses = []
                         st.session_state.selected_courses = []
                         st.session_state.analysis_completed = False
                     
+                    # 获取考试科目
                     if not st.session_state.courses:
                         with st.spinner("正在获取考试科目..."):
                             courses = get_exam_courses(st.session_state.token, selected_exam['examgroup'])
-                            if courses: st.session_state.courses = courses
-                            else: st.error("未获取到考试科目")
+                            if courses:
+                                st.session_state.courses = courses
+                            else:
+                                st.error("未获取到考试科目")
                     
+                    # 选择科目
                     if st.session_state.courses:
                         course_names = [course['coursename'] for course in st.session_state.courses]
                         selected_course_indices = st.multiselect("选择科目:", range(len(course_names)), format_func=lambda x: course_names[x])
@@ -476,62 +654,52 @@ else:
                             selected_courses = [st.session_state.courses[idx] for idx in selected_course_indices]
                             st.session_state.selected_courses = selected_courses
                             
+                            # 获取数据按钮
                             if st.button("🚀 开始获取数据并分析", type="primary", use_container_width=True):
-                                # 【性能优化】并发获取多科目数据，速度提升 5~10 倍
-                                all_data = []
-                                links_info_list = []
-                                course_names_selected = []
-                                
-                                # 将 token 作为参数传入，避免子线程无法读取 st.session_state 的报错
-                                def fetch_single_course(course, token_val):
-                                    c_name = course['coursename']
-                                    c_id = course['examid']
-                                    students = get_exam_students(token_val, c_id)
-                                    df = process_student_data(students, c_name)
-                                    links = get_image_links(token_val, c_id)
-                                    return df, links, c_name
-
-                                with st.spinner("🚀 正在极速并发获取各科目数据..."):
-                                    # 主线程提前提取 token 给多线程使用
-                                    current_token = st.session_state.token 
+                                with st.spinner("正在获取数据并分析..."):
+                                    # 批量获取学生数据
+                                    all_data = []
+                                    links_info_list = []
+                                    course_names_selected = []
                                     
-                                    with ThreadPoolExecutor(max_workers=min(10, len(selected_courses))) as executor:
-                                        future_to_course = {executor.submit(fetch_single_course, c, current_token): c for c in selected_courses}
-                                        progress_bar = st.progress(0)
-                                        
-                                        for i, future in enumerate(as_completed(future_to_course)):
-                                            c_name = future_to_course[future]['coursename']
-                                            try:
-                                                df, links, name = future.result()
-                                                if not df.empty:
-                                                    all_data.append(df)
-                                                    links_info_list.append(links)
-                                                    course_names_selected.append(name)
-                                                    st.toast(f"✅ {name} 数据获取完成")
-                                                else:
-                                                    st.warning(f"⚠️ {name} 未获取到学生数据")
-                                            except Exception as e:
-                                                st.error(f"❌ 获取 {c_name} 数据失败: {str(e)}")
-                                            progress_bar.progress((i + 1) / len(selected_courses))
-                                        progress_bar.empty()
-
-                                if all_data:
-                                    with st.spinner("🔄 正在聚合分析数据..."):
+                                    for course in selected_courses:
+                                        st.write(f"正在处理科目: {course['coursename']}")
+                                        # 获取学生数据
+                                        students = get_exam_students(st.session_state.token, course['examid'])
+                                        if students:
+                                            # 处理学生数据
+                                            df = process_student_data(students, course['coursename'])
+                                            all_data.append(df)
+                                            # 获取图片链接
+                                            links_info = get_image_links(st.session_state.token, course['examid'])
+                                            links_info_list.append(links_info)
+                                            course_names_selected.append(course['coursename'])
+                                        else:
+                                            st.warning(f"未获取到 {course['coursename']} 的学生数据")
+                                    
+                                    # 合并所有数据
+                                    if all_data:
                                         all_merged = pd.concat(all_data, ignore_index=True)
                                         st.session_state.all_merged_data = all_merged
                                         
+                                        # 分类扫描状态
                                         classification_result = classify_scan_status(all_merged)
+                                        
+                                        # 生成学生名单数据
                                         st.session_state.report_sheets['名单数据'] = generate_student_list_data(all_merged)
                                         
+                                        # 保存分类结果到report_sheets
                                         for sheet_name, df in classification_result.items():
                                             if not df.empty:
                                                 st.session_state.report_sheets[sheet_name] = df
                                         
+                                        # 处理状态差异数据
                                         new_diff_df = classification_result['状态差异'].copy()
                                         if not new_diff_df.empty:
                                             new_diff_df.insert(0, '处理进度', '未处理')
                                             new_diff_df.insert(1, '处理备注', '')
                                         
+                                        # 继承历史标记
                                         inherited_count = 0
                                         if history_file and not new_diff_df.empty:
                                             try:
@@ -546,9 +714,12 @@ else:
                                                 st.warning(f"⚠️ 提取历史继承数据时出错: {e}")
                                         
                                         st.session_state.diff_df = new_diff_df
+                                        
+                                        # 显示继承结果
                                         if inherited_count > 0:
                                             st.success(f"🎉 成功继承了 {inherited_count} 名考生的历史标记！")
                                         
+                                        # 解析图片映射
                                         if links_info_list:
                                             st.session_state.img_mapping = parse_image_mappings(links_info_list, course_names_selected)
                                             st.session_state.enable_viewer = True
@@ -562,8 +733,8 @@ else:
                                         st.session_state.data_changed = False
                                         generate_latest_excel()
                                         st.success("数据获取和分析完成！")
-                                else:
-                                    st.error("未获取到任何学生数据")
+                                    else:
+                                        st.error("未获取到任何学生数据")
 
 # -------------------------- 沉浸式双核处理台 --------------------------
 if st.session_state.analysis_completed:
@@ -611,6 +782,7 @@ if st.session_state.analysis_completed:
 
         st.markdown("---")
         
+        # -------------------------- 双模式工作台 Tab --------------------------
         tab1, tab2 = st.tabs(["🎯 逐个精细核对 (支持快捷键)", "🗂️ 按学校批量打标"])
 
         # ========================== TAB 1: 逐个核对模式 ==========================
@@ -635,13 +807,10 @@ if st.session_state.analysis_completed:
             if display_df.empty:
                 st.info(f"✨ 当前视图下 ({selected_filter}) 暂无需要处理的考生。")
             else:
-                # 【性能优化】使用 numpy 向量化字符串拼接代替 DataFrame iterrows 遍历，渲染速度提升 100 倍
-                status_icons = np.where(display_df['处理进度'] == '已标记', "🟢 [已标记] ", "🔴 [未处理] ")
-                options = (status_icons + 
-                           display_df['考号'].astype(str) + " | " + 
-                           display_df['姓名'].astype(str) + " | " + 
-                           display_df['学校'].astype(str) + " " + 
-                           display_df['班级'].astype(str)).tolist()
+                options = []
+                for _, row in display_df.iterrows():
+                    status_icon = "🟢 [已标记]" if str(row.get('处理进度')) == '已标记' else "🔴 [未处理]"
+                    options.append(f"{status_icon} {row['考号']} | {row['姓名']} | {row['学校']} {row['班级']}")
 
                 if st.session_state.current_idx >= len(options):
                     st.session_state.current_idx = max(0, len(options) - 1)
@@ -665,7 +834,6 @@ if st.session_state.analysis_completed:
                 
                 st.markdown("<br>", unsafe_allow_html=True)
                 
-                # 提取学生ID
                 student_id = selected_option.split(" | ")[0].split("] ")[1].strip()
                 student_name = selected_option.split(" | ")[1].strip()
                 matched_rows = display_df[display_df['考号'].astype(str) == student_id]
@@ -717,11 +885,14 @@ if st.session_state.analysis_completed:
                                     st.rerun()
 
                             tag_col1, tag_col2 = st.columns(2)
-                            if tag_col1.button("🚨 缺考", use_container_width=True): save_and_go_next("缺考")
-                            if tag_col2.button("📝 白卷", use_container_width=True): save_and_go_next("白卷")
-                            if tag_col1.button("✂️ 条码破损", use_container_width=True): save_and_go_next("条码破损")
-                            if tag_col2.button("🚫 走错考场", use_container_width=True): save_and_go_next("走错考场")
-                            
+                            if tag_col1.button("🚨 缺考", use_container_width=True):
+                                save_and_go_next("缺考")
+                            if tag_col2.button("📝 白卷", use_container_width=True):
+                                save_and_go_next("白卷")
+                            if tag_col1.button("✂️ 条码破损", use_container_width=True):
+                                save_and_go_next("条码破损")
+                            if tag_col2.button("🚫 走错考场", use_container_width=True):
+                                save_and_go_next("走错考场")
                             if st.button("⏪ 撤销标记 (退回未处理)", use_container_width=True):
                                 idx_to_update = st.session_state.diff_df.index[st.session_state.diff_df['考号'].astype(str) == student_id].tolist()
                                 if idx_to_update:
@@ -746,16 +917,20 @@ if st.session_state.analysis_completed:
             st.subheader("🏢 按学校快速批量标记")
             st.caption("对于因为未收齐等原因导致的某个学校群体性异常，您可以在这里一键全选标记。")
             
+            # 只提取未处理的数据进行批量操作
             unprocessed_df = diff_df[diff_df['处理进度'] == '未处理']
             
             if unprocessed_df.empty:
                 st.success("🎉 太棒了，当前没有任何「未处理」的学生需要批量打标！")
             else:
+                # 计算每个学校的未处理学生数量
                 school_counts = unprocessed_df['学校'].value_counts()
+                # 创建显示格式：学校 | 人数
                 school_options = [f"{school} | {school_counts[school]}人" for school in school_counts.index]
                 selected_option = st.selectbox("1️⃣ 请选择要批量处理的学校：", school_options)
-                
+                # 提取学校名称
                 selected_school = selected_option.split(' | ')[0]
+                
                 school_df = unprocessed_df[unprocessed_df['学校'] == selected_school]
                 school_count = len(school_df)
                 
@@ -767,11 +942,12 @@ if st.session_state.analysis_completed:
                     if not batch_remark:
                         st.warning("⚠️ 请先输入异常原因！")
                     else:
+                        # 获取这批学生在总表中的真实索引并统一修改
                         batch_indexes = school_df.index
                         st.session_state.diff_df.loc[batch_indexes, '处理进度'] = '已标记'
                         st.session_state.diff_df.loc[batch_indexes, '处理备注'] = batch_remark
                         st.session_state.data_changed = True
-                        st.session_state.current_idx = 0
+                        st.session_state.current_idx = 0  # 重置单兵模式的指针
                         
                         st.toast(f"✅ 成功将 {selected_school} 的 {school_count} 名考生批量标记！")
                         st.rerun()
